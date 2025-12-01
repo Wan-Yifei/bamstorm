@@ -247,3 +247,4 @@ __marimo__/
 ### Bioinformatics ignore list
 *.bam
 *.bai
+*.sam

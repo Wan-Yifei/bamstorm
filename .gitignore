@@ -238,3 +238,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Added by cargo
+
+/target
+
+### Bioinformatics ignore list
+*.bam
+*.bai

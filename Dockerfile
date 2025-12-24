@@ -7,3 +7,5 @@ COPY ./src src
 COPY Cargo.lock Cargo.lock
 COPY Cargo.toml Cargo.toml
 
+# Default to interactive bash
+CMD ["/bin/bash"]

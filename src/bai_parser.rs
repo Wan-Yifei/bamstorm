@@ -1,12 +1,10 @@
 use std::fs::File;
-use std::fmt::format;
-use std::slice::Windows;
 
 use noodles::bam::bai;
-use noodles::bgzf::{VirtualPosition, virtual_position};
+use noodles::bgzf::VirtualPosition;
 
 const DEFALUT_MAX_COMPRESSED_OFFSET: u64 = (1 << 48) - 1;
-const DEFALUT_MIN_UNCOMPRESSED_OFFSET: u16 = u16::MAX;
+// const DEFALUT_MIN_UNCOMPRESSED_OFFSET: u16 = u16::MAX;
 
 // Get file size
 pub fn get_file_size(file_path: &str) -> std::io::Result<u64> {
@@ -105,21 +103,11 @@ mod tests {
     #[ignore]
     fn test_read_bai() -> Result<(), Box<dyn std::error::Error>> {
         let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
-        let bam_path = "/Users/yifeiwan/Projects/bamstorm_old/tests/chr1.bam";
         // let bai_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam.bai";
-        // let bam_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam";
-        let bam_size = get_file_size(bam_path)?;
         let linear_indexes_all = get_linear_indexes(bai_path)?;
         println!("First linear index: {:?}", linear_indexes_all.first().unwrap());
         let intervals = get_linear_intervals(&linear_indexes_all)?;
         println!("First interval: {:?}", intervals[0]);
-        // let ind = bai::fs::read(bai_path)?;
-        // let ref_seqs = ind.reference_sequences();
-        // let ref_seq_0 = ref_seqs.iter().next();
-        // println!("{:?}", ref_seq_0);
-        // assert_eq!(linear_indexes_all.len(), 176782);
-        // assert_eq!(intervals.len(), 104030);
-        // println!("Head of linear indexes: {:?}", &intervals[0..2]);
         Ok(())
     }
 
@@ -155,7 +143,6 @@ mod tests {
     #[ignore]
     fn check_get_linear_indexes() -> Result<(), Box<dyn std::error::Error>> {
         let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
-        let bam_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam";
         let linear_indexes_all = get_linear_indexes(bai_path)?;
         let intervals = get_linear_intervals(&linear_indexes_all)?;
         println!("Head of linear indexes: {:?}", &intervals[0..2]);

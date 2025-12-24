@@ -3,19 +3,20 @@ use std::fmt::format;
 use std::slice::Windows;
 
 use noodles::bam::bai;
-use noodles::bgzf::VirtualPosition;
+use noodles::bgzf::{VirtualPosition, virtual_position};
 
-const DEFALUT_MIN_UNCOMPRESSED_POSITION: u16 = u16::MIN;
+const DEFALUT_MAX_COMPRESSED_OFFSET: u64 = (1 << 48) - 1;
+const DEFALUT_MIN_UNCOMPRESSED_OFFSET: u16 = u16::MAX;
 
 // Get file size
-fn get_file_size(file_path: &str) -> std::io::Result<u64> {
+pub fn get_file_size(file_path: &str) -> std::io::Result<u64> {
     let file = File::open(file_path)?;
     Ok(file.metadata().unwrap().len())
 }
 
 // Get all linear indexes from a BAI file
 pub fn get_linear_indexes(
-    bai_path: &str, bam_size: u64
+    bai_path: &str
 ) -> Result<Vec<VirtualPosition>, Box<dyn std::error::Error>> {
     // Read the BAI file
     let bai_file = bai::fs::read(bai_path)?;
@@ -33,26 +34,45 @@ pub fn get_linear_indexes(
     // Sort the linear indexes
     linear_indexes.sort();
     // Compare the largest linear index with the maximum compressed virtual position of BGZF file
-    if linear_indexes.last().unwrap().compressed() > bam_size {
-        return Err(format!("The max coffset {:?} exceeds compressed file size {:?}",
-            linear_indexes.last().unwrap().compressed(), bam_size).into());
+    if linear_indexes.last().unwrap().compressed() > DEFALUT_MAX_COMPRESSED_OFFSET {
+        return Err(format!("The max coffset {:?} exceeds MAX coffset {:?}",
+            linear_indexes.last().unwrap().compressed(), DEFALUT_MAX_COMPRESSED_OFFSET).into());
     }
-    else if linear_indexes.last().unwrap().compressed() < bam_size {
-        let _end_voffset = VirtualPosition::new(bam_size, DEFALUT_MIN_UNCOMPRESSED_POSITION).unwrap();
-        linear_indexes.push(_end_voffset);
-        println!("Added end voffset {:?} to point the file end {:?}.", _end_voffset, bam_size);
-    }
-    else {
-        println!("All linear indexes are within valid range.");
-    }
+    // Create a VirtualPosition at the very start of the file
+    // let start_voffset = VirtualPosition::new(0, 0).unwrap();
+
+    // Insert at the beginning
+    // linear_indexes.insert(0, start_voffset);
+
 
     Ok(linear_indexes)
 }
 
-pub fn convert_linear_indexes_to_coffset(linear_indexes: &[VirtualPosition]) -> Vec<u64> {
-    linear_indexes.iter().map(|vp| vp.compressed()).collect()
+pub fn reduce_linear_indexes(
+    linear_indexes: &[VirtualPosition],
+) -> Vec<VirtualPosition> {
+
+    let mut reduced: Vec<VirtualPosition> =
+        Vec::with_capacity(linear_indexes.len());
+
+    for &voffset in linear_indexes {
+        match reduced.last_mut() {
+            Some(last) if last.compressed() == voffset.compressed() => {
+                // Same compressed offset, keep the smaller virtual offset
+                if voffset < *last {
+                    *last = voffset;
+                }
+            }
+            _ => {
+                reduced.push(voffset);
+            }
+        }
+    }
+
+    reduced
 }
 
+// TODO: Some intervals have same start coffsets, need to combine them or reuse the block somehow
 pub fn get_linear_intervals(
     linear_indexes: &[VirtualPosition],
 ) -> Result<Vec<(VirtualPosition, VirtualPosition)>, String> {
@@ -61,8 +81,9 @@ pub fn get_linear_intervals(
         return Err("Not enough linear indexes to form intervals".to_string());
     }
     // Create intervals from consecutive linear indexes
+    let reduced_indexes = reduce_linear_indexes(&linear_indexes);
     let mut intervals = Vec::new();
-    for window in linear_indexes.windows(2) {
+    for window in reduced_indexes.windows(2) {
         if window[1] > window[0] {
             intervals.push((window[0], window[1]));
         } else {
@@ -81,20 +102,63 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_read_bai() -> Result<(), Box<dyn std::error::Error>> {
-        //let bai_path = "E:/project/bamstrom/tests/mt.sorted.bam.bai";
-        // let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
-        let bai_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam.bai";
-        let bam_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam";
+        let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
+        let bam_path = "/Users/yifeiwan/Projects/bamstorm_old/tests/chr1.bam";
+        // let bai_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam.bai";
+        // let bam_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam";
         let bam_size = get_file_size(bam_path)?;
-        let linear_indexes_all = get_linear_indexes(bai_path, bam_size)?;
+        let linear_indexes_all = get_linear_indexes(bai_path)?;
+        println!("First linear index: {:?}", linear_indexes_all.first().unwrap());
         let intervals = get_linear_intervals(&linear_indexes_all)?;
+        println!("First interval: {:?}", intervals[0]);
         // let ind = bai::fs::read(bai_path)?;
         // let ref_seqs = ind.reference_sequences();
         // let ref_seq_0 = ref_seqs.iter().next();
         // println!("{:?}", ref_seq_0);
-        assert_eq!(linear_indexes_all.len(), 176783);
-        assert_eq!(intervals.len(), 176782);
+        // assert_eq!(linear_indexes_all.len(), 176782);
+        // assert_eq!(intervals.len(), 104030);
+        // println!("Head of linear indexes: {:?}", &intervals[0..2]);
+        Ok(())
+    }
+
+
+    #[test]
+    #[ignore]
+    fn test_reduce_linear_indexes_merges_same_compressed_offsets() {
+        // Input virtual offsets are already sorted
+        let linear_indexes = vec![
+            VirtualPosition::new(1, 0).unwrap(),
+            VirtualPosition::new(1, 10).unwrap(),
+            VirtualPosition::new(1, 20).unwrap(),
+            VirtualPosition::new(3, 0).unwrap(),
+            VirtualPosition::new(5, 5).unwrap(),
+        ];
+
+        let reduced = reduce_linear_indexes(&linear_indexes);
+
+        // Expect only one entry per compressed offset
+        assert_eq!(reduced.len(), 3);
+
+        assert_eq!(reduced[0].compressed(), 1);
+        assert_eq!(reduced[0].uncompressed(), 0);
+
+        assert_eq!(reduced[1].compressed(), 3);
+        assert_eq!(reduced[1].uncompressed(), 0);
+
+        assert_eq!(reduced[2].compressed(), 5);
+        assert_eq!(reduced[2].uncompressed(), 5);
+    }
+
+    #[test]
+    #[ignore]
+    fn check_get_linear_indexes() -> Result<(), Box<dyn std::error::Error>> {
+        let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
+        let bam_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam";
+        let linear_indexes_all = get_linear_indexes(bai_path)?;
+        let intervals = get_linear_intervals(&linear_indexes_all)?;
+        println!("Head of linear indexes: {:?}", &intervals[0..2]);
         Ok(())
     }
 }

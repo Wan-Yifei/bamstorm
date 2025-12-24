@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 noodles = { version = "0.102.0", features = ["bam", "bgzf", "csi", "sam"] }
+rayon = "1.11.0"

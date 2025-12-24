@@ -113,15 +113,16 @@ pub fn count_all_records(
     thread_num: u64,
 ) -> io::Result<u64> {
 
-    let mut total_records: u64 = 0;
     let all_interval_readers = get_entire_bam_reader(bam_path, intervals, thread_num)?;
-
-    for mut reader in all_interval_readers {
+    let total_records: u64 = all_interval_readers.into_par_iter().map(|mut reader| {
+        let mut local_count: u64 = 0;
         for result in reader.records() {
             let _record = result?;
-            total_records += 1;
+            local_count += 1;
         }
-    }
+        Ok(local_count)
+        })
+        .sum::<io::Result<u64>>()?;
 
     println!("===== Total number of records from interval reader: {}.", total_records);
     Ok(total_records)
@@ -135,9 +136,10 @@ mod test {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_standard_bam_read_with_timer() -> Result<(), Box<dyn std::error::Error>> {
         // Run bam_read and propagate any errors
-        let test_bam = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam";
+        let test_bam = "tests/chr1.bam";
         // let test_bam = "/Users/yifeiwan/Projects/bamstorm/tests/full.bam";
         timeit(|| standard_bam_read(test_bam, 4))?;
         Ok(())
@@ -146,8 +148,8 @@ mod test {
     #[test]
     #[ignore]
     fn test_bam_read_by_interval() -> Result<(), Box<dyn std::error::Error>> {
-        let test_bam = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam";
-        let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
+        let test_bam = "tests/chr1.bam";
+        let bai_path = "tests/chr1.bam.bai";
         // let bai_path = "/Users/yifeiwan/Projects/bamstorm/full.bam.bai";
         // let test_bam = "/Users/yifeiwan/Projects/bamstorm/full.bam";
         let linear_indexes_all = get_linear_indexes(bai_path)?;
@@ -161,11 +163,11 @@ mod test {
     fn test_read_through_intervals() -> Result<(), Box<dyn std::error::Error>> {
         // let test_bam = "/Users/yifeiwan/Projects/bamstorm/tests/full.bam";
         // let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/full.bam.bai";
-        let test_bam = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam";
-        let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
+        let test_bam = "tests/chr1.bam";
+        let bai_path = "tests/chr1.bam.bai";
         let linear_indexes_all = get_linear_indexes(bai_path)?;
         let intervals = get_linear_intervals(&linear_indexes_all)?;
-        let standard_reader_total_records:u64= standard_bam_read(test_bam, 4)?;
+        let standard_reader_total_records:u64= timeit(|| standard_bam_read(test_bam, 4))?;
         let all_intervals_total_records = timeit(|| count_all_records(test_bam, &intervals, 4))?;
         assert_eq!(all_intervals_total_records, standard_reader_total_records);
         Ok(())

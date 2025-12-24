@@ -136,7 +136,6 @@ mod test {
     use super::*;
 
     #[test]
-    #[ignore]
     fn test_standard_bam_read_with_timer() -> Result<(), Box<dyn std::error::Error>> {
         // Run bam_read and propagate any errors
         let test_bam = "tests/chr1.bam";
@@ -167,7 +166,7 @@ mod test {
         let bai_path = "tests/chr1.bam.bai";
         let linear_indexes_all = get_linear_indexes(bai_path)?;
         let intervals = get_linear_intervals(&linear_indexes_all)?;
-        let standard_reader_total_records:u64= timeit(|| standard_bam_read(test_bam, 4))?;
+        let standard_reader_total_records:u64= standard_bam_read(test_bam, 4)?;
         let all_intervals_total_records = timeit(|| count_all_records(test_bam, &intervals, 4))?;
         assert_eq!(all_intervals_total_records, standard_reader_total_records);
         Ok(())

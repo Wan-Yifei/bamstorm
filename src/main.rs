@@ -1,8 +1,11 @@
-use bamstrom::{get_bam_header, update_bam_record, bai_parser::get_linear_indexes, bai_parser::get_linear_intervals, process_records_through_intervals};
-use std::sync::{Arc, Mutex};
-use std::{fs::File, collections::HashMap};
-use std::error::Error;
+use bamstrom::{
+    bai_parser::get_linear_indexes, bai_parser::get_linear_intervals, get_bam_header,
+    process_records_through_intervals, update_bam_record,
+};
 use noodles::bam as noodles_bam;
+use std::error::Error;
+use std::sync::{Arc, Mutex};
+use std::{collections::HashMap, fs::File};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let output_path = "output.bam";
@@ -26,13 +29,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Process BAM records
     let output_writer = Arc::new(Mutex::new(writer));
-    process_records_through_intervals(input_path, &intervals, 4, output_writer, |record, output_writer| {
-        // For demonstration, replace read name old_name with "new_name"
-        let updated_record = update_bam_record(&_header, &record, &updated_fields, "SOLEXA-1GA-2_2_FC20EMB", output_writer)?;
-        Ok(updated_record)
-    })?;
-
+    process_records_through_intervals(
+        input_path,
+        &intervals,
+        4,
+        output_writer,
+        |record, output_writer| {
+            // For demonstration, replace read name old_name with "new_name"
+            let updated_record = update_bam_record(
+                &_header,
+                &record,
+                &updated_fields,
+                "SOLEXA-1GA-2_2_FC20EMB",
+                output_writer,
+            )?;
+            Ok(updated_record)
+        },
+    )?;
 
     Ok(())
 }
-

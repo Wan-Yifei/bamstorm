@@ -1,9 +1,9 @@
 use noodles::bam;
-use noodles::bgzf::{io as bgzf_io, VirtualPosition};
+use noodles::bgzf::{VirtualPosition, io as bgzf_io};
 use rayon::prelude::*;
 use std::{
     fs::File,
-    io::{self, prelude::*, Cursor, Seek as f_seek, SeekFrom},
+    io::{self, Cursor, Seek as f_seek, SeekFrom, prelude::*},
     num::NonZero,
 };
 
@@ -115,8 +115,6 @@ pub fn get_entire_bam_reader(
     Ok(all_interval_readers)
 }
 
-
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -145,6 +143,4 @@ mod test {
         // println!("{:?}", test_bam);
         Ok(())
     }
-
-
 }

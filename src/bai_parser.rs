@@ -14,7 +14,7 @@ pub fn get_file_size(file_path: &str) -> std::io::Result<u64> {
 
 // Get all linear indexes from a BAI file
 pub fn get_linear_indexes(
-    bai_path: &str
+    bai_path: &str,
 ) -> Result<Vec<VirtualPosition>, Box<dyn std::error::Error>> {
     // Read the BAI file
     let bai_file = bai::fs::read(bai_path)?;
@@ -33,8 +33,12 @@ pub fn get_linear_indexes(
     linear_indexes.sort();
     // Compare the largest linear index with the maximum compressed virtual position of BGZF file
     if linear_indexes.last().unwrap().compressed() > DEFALUT_MAX_COMPRESSED_OFFSET {
-        return Err(format!("The max coffset {:?} exceeds MAX coffset {:?}",
-            linear_indexes.last().unwrap().compressed(), DEFALUT_MAX_COMPRESSED_OFFSET).into());
+        return Err(format!(
+            "The max coffset {:?} exceeds MAX coffset {:?}",
+            linear_indexes.last().unwrap().compressed(),
+            DEFALUT_MAX_COMPRESSED_OFFSET
+        )
+        .into());
     }
     // Create a VirtualPosition at the very start of the file
     // let start_voffset = VirtualPosition::new(0, 0).unwrap();
@@ -42,16 +46,11 @@ pub fn get_linear_indexes(
     // Insert at the beginning
     // linear_indexes.insert(0, start_voffset);
 
-
     Ok(linear_indexes)
 }
 
-pub fn reduce_linear_indexes(
-    linear_indexes: &[VirtualPosition],
-) -> Vec<VirtualPosition> {
-
-    let mut reduced: Vec<VirtualPosition> =
-        Vec::with_capacity(linear_indexes.len());
+pub fn reduce_linear_indexes(linear_indexes: &[VirtualPosition]) -> Vec<VirtualPosition> {
+    let mut reduced: Vec<VirtualPosition> = Vec::with_capacity(linear_indexes.len());
 
     for &voffset in linear_indexes {
         match reduced.last_mut() {
@@ -105,12 +104,14 @@ mod tests {
         let bai_path = "/Users/yifeiwan/Projects/bamstorm/tests/chr1.bam.bai";
         // let bai_path = "/Users/yifeiwan/Projects/bamstorm_old/test.bam.bai";
         let linear_indexes_all = get_linear_indexes(bai_path)?;
-        println!("First linear index: {:?}", linear_indexes_all.first().unwrap());
+        println!(
+            "First linear index: {:?}",
+            linear_indexes_all.first().unwrap()
+        );
         let intervals = get_linear_intervals(&linear_indexes_all)?;
         println!("First interval: {:?}", intervals[0]);
         Ok(())
     }
-
 
     #[test]
     #[ignore]

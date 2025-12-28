@@ -1,15 +1,23 @@
 pub mod bai_parser;
 pub mod bam_parser;
 pub mod timer;
-use std::fs::File;
+use bstr::{BString, ByteSlice};
 use noodles::bam::io::reader::header;
 use noodles::bam::record;
-use noodles::bgzf::{io as bgzf_io, VirtualPosition};
 use noodles::bam::{self as noodles_bam, record::Record};
-use noodles::sam::{self as noodles_sam, alignment::{RecordBuf, io::Write}, Header};
-use std::{io, num::NonZero, collections::HashMap, sync::{Arc, Mutex}};
-use bstr::{BString, ByteSlice};
+use noodles::bgzf::{VirtualPosition, io as bgzf_io};
+use noodles::sam::{
+    self as noodles_sam, Header,
+    alignment::{RecordBuf, io::Write},
+};
 use rayon::prelude::*;
+use std::fs::File;
+use std::{
+    collections::HashMap,
+    io,
+    num::NonZero,
+    sync::{Arc, Mutex},
+};
 
 //TODO: move count records to here
 //TODO: implement BAM storm func(F)
@@ -29,10 +37,9 @@ pub fn count_from_standard_bam_reader(bam_path: &str, thread_num: u64) -> io::Re
     let worker_count = NonZero::new(thread_num as usize).unwrap_or(NonZero::<usize>::MIN);
     // Set Multithread Reader
     let bam_file = File::open(bam_path)?;
-    let mut reader = noodles_bam::io::Reader::from(bgzf_io::MultithreadedReader::with_worker_count(
-        worker_count,
-        bam_file,
-    ));
+    let mut reader = noodles_bam::io::Reader::from(
+        bgzf_io::MultithreadedReader::with_worker_count(worker_count, bam_file),
+    );
     let _header = reader.read_header()?;
     let mut n_records: u64 = 0;
     for result in reader.records() {
@@ -83,10 +90,14 @@ pub fn process_records_through_intervals<F>(
     process_record: F,
 ) -> io::Result<()>
 where
-    F: Fn(&noodles_bam::record::Record, &Arc<Mutex<noodles_bam::io::Writer<bgzf_io::Writer<File>>>>) -> Result<(), Box<dyn std::error::Error>> + Send + Sync,
+    F: Fn(
+            &noodles_bam::record::Record,
+            &Arc<Mutex<noodles_bam::io::Writer<bgzf_io::Writer<File>>>>,
+        ) -> Result<(), Box<dyn std::error::Error>>
+        + Send
+        + Sync,
 {
-    let all_interval_readers =
-        bam_parser::get_entire_bam_reader(bam_path, intervals, thread_num)?;
+    let all_interval_readers = bam_parser::get_entire_bam_reader(bam_path, intervals, thread_num)?;
 
     all_interval_readers
         .into_par_iter()
@@ -101,14 +112,20 @@ where
     Ok(())
 }
 
-
-fn replace_phi(original_string: &str, phi_pattern: &str, new_string: &str) -> Result<String, std::io::Error> {
+fn replace_phi(
+    original_string: &str,
+    phi_pattern: &str,
+    new_string: &str,
+) -> Result<String, std::io::Error> {
     let updated_string = original_string.replace(phi_pattern, new_string);
     Ok(updated_string)
 }
 
 // Convert a generic SAM Record/RecordBuf into a BAM record
-pub fn try_into_bam_record<R>(header: &noodles_sam::Header, record: &R) -> io::Result<noodles_bam::Record>
+pub fn try_into_bam_record<R>(
+    header: &noodles_sam::Header,
+    record: &R,
+) -> io::Result<noodles_bam::Record>
 where
     R: noodles_sam::alignment::Record,
 {
@@ -152,10 +169,12 @@ pub fn update_bam_record(
         }
     }
     let updated_record = try_into_bam_record(header, &updated_record)?;
-    output_writer.lock().unwrap().write_record(&header, &updated_record)?;
+    output_writer
+        .lock()
+        .unwrap()
+        .write_record(&header, &updated_record)?;
     Ok(())
 }
-
 
 // Tests
 #[cfg(test)]

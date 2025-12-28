@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bstr = "1.12.1"
 noodles = { version = "0.102.0", features = ["bam", "bgzf", "csi", "sam"] }
 rayon = "1.11.0"

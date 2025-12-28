@@ -7,7 +7,7 @@ use std::{
     num::NonZero,
 };
 
-pub fn standard_bam_read(bam_path: &str, thread_num: u64) -> io::Result<u64> {
+pub fn count_from_standard_bam_reader(bam_path: &str, thread_num: u64) -> io::Result<u64> {
     // Set Single/Multiple threads Reader
     let worker_count = NonZero::new(thread_num as usize).unwrap_or(NonZero::<usize>::MIN);
     // Set Multithread Reader
@@ -115,30 +115,7 @@ pub fn get_entire_bam_reader(
     Ok(all_interval_readers)
 }
 
-pub fn count_all_records(
-    bam_path: &str,
-    intervals: &[(VirtualPosition, VirtualPosition)],
-    thread_num: u64,
-) -> io::Result<u64> {
-    let all_interval_readers = get_entire_bam_reader(bam_path, intervals, thread_num)?;
-    let total_records: u64 = all_interval_readers
-        .into_par_iter()
-        .map(|mut reader| {
-            let mut local_count: u64 = 0;
-            for result in reader.records() {
-                let _record = result?;
-                local_count += 1;
-            }
-            Ok(local_count)
-        })
-        .sum::<io::Result<u64>>()?;
 
-    println!(
-        "===== Total number of records from interval reader: {}.",
-        total_records
-    );
-    Ok(total_records)
-}
 
 #[cfg(test)]
 mod test {
@@ -169,25 +146,5 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_read_through_intervals() -> Result<(), Box<dyn std::error::Error>> {
-        // let test_bam = "tests/full.bam";
-        // let bai_path = "tests/full.bam.bai";
-        // let test_bam = "tests/chr1.bam";
-        // let bai_path = "tests/chr1.bam.bai";
-        let test_bam = "tests/chr_all.bam";
-        let bai_path = "tests/chr_all.bam.bai";
-        // let test_bam = "tests/wgEncode.bam";
-        // let bai_path = "tests/wgEncode.bam.bai";
-        println!(
-            "===== Testing read through intervals for BAM: {:?}.",
-            test_bam
-        );
-        let linear_indexes_all = get_linear_indexes(bai_path)?;
-        let intervals = get_linear_intervals(&linear_indexes_all)?;
-        let standard_reader_total_records: u64 = standard_bam_read(test_bam, 4)?;
-        let all_intervals_total_records = timeit(|| count_all_records(test_bam, &intervals, 4))?;
-        assert_eq!(all_intervals_total_records, standard_reader_total_records);
-        Ok(())
-    }
+
 }

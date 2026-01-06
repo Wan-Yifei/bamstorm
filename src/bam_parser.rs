@@ -7,30 +7,6 @@ use std::{
     num::NonZero,
 };
 
-pub fn count_from_standard_bam_reader(bam_path: &str, thread_num: u64) -> io::Result<u64> {
-    // Set Single/Multiple threads Reader
-    let worker_count = NonZero::new(thread_num as usize).unwrap_or(NonZero::<usize>::MIN);
-    // Set Multithread Reader
-    let bam_file = File::open(bam_path)?;
-    let mut reader = bam::io::Reader::from(bgzf_io::MultithreadedReader::with_worker_count(
-        worker_count,
-        bam_file,
-    ));
-    let _header = reader.read_header()?;
-    let mut n_records: u64 = 0;
-    for result in reader.records() {
-        let _record = result?;
-        n_records += 1;
-        // Process the record as needed
-        // For demonstration, we will just print the read name
-    }
-    println!(
-        "===== Total number of records from standard reader: {}.",
-        n_records
-    );
-    Ok(n_records)
-}
-
 pub fn read_bam_by_interval(
     bam_path: &str,
     start_voffset: VirtualPosition,
@@ -120,15 +96,6 @@ mod test {
     use super::*;
     use crate::bai_parser::{get_linear_indexes, get_linear_intervals};
     use crate::timer::timeit;
-
-    #[test]
-    fn test_standard_bam_read_with_timer() -> Result<(), Box<dyn std::error::Error>> {
-        // Run bam_read and propagate any errors
-        let test_bam = "tests/chr_all.bam";
-        // let test_bam = "tests/full.bam";
-        timeit(|| standard_bam_read(test_bam, 4))?;
-        Ok(())
-    }
 
     #[test]
     #[ignore]

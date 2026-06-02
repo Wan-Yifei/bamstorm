@@ -74,9 +74,8 @@ WORKDIR /app
 # bamstrom counter
 COPY --from=builder /build/target/release/bench_count /app/bench_count
 
-# RabbitBAM binary + its shared libs
-COPY --from=rabbitbam-builder /opt/RabbitBAM/rabbitbam /opt/RabbitBAM/rabbitbam
-COPY --from=rabbitbam-builder /opt/RabbitBAM/librabbitbam*.so /opt/RabbitBAM/
+# RabbitBAM binary + all build artifacts (binary links against tools.o and .so files)
+COPY --from=rabbitbam-builder /opt/RabbitBAM /opt/RabbitBAM
 
 # htslib / libdeflate shared libs needed at runtime
 COPY --from=rabbitbam-builder /usr/local/lib/libhts.so* /usr/local/lib/

@@ -79,7 +79,12 @@ def fmt_row(label: str, threads: int | str, elapsed: float,
 def run_bamstrom(bam: str, bai: str, threads: int) -> tuple[float, int]:
     cmd = [BENCH_COUNT_BIN, "--threads", str(threads), bam, bai]
     t0 = time.perf_counter()
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"bench_count failed (exit {exc.returncode}):\n{exc.stderr.strip()}"
+        ) from exc
     return time.perf_counter() - t0, int(result.stdout.strip())
 
 

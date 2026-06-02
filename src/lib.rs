@@ -1,6 +1,9 @@
 pub mod bai_parser;
 pub mod bam_parser;
 pub mod timer;
+#[cfg(feature = "python")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub mod python;
 use bstr::{BString, ByteSlice};
 use noodles::bam::{self as noodles_bam, record::Record};
 use noodles::bgzf::{VirtualPosition, io as bgzf_io};

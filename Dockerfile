@@ -11,21 +11,81 @@ COPY src ./src
 
 RUN cargo build --release --bin bench_count
 
-# Stage 2: runtime image with samtools + python3-pysam
+# Stage 2: build RabbitBAM and its dependencies (htslib + libdeflate) from source
+FROM debian:bookworm-slim AS rabbitbam-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    make \
+    g++ \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    cmake \
+    zlib1g-dev \
+    libbz2-dev \
+    liblzma-dev \
+    libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# libdeflate >= 1.12 (RabbitBAM dependency)
+RUN git clone --depth 1 --branch v1.22 https://github.com/ebiggers/libdeflate.git /opt/libdeflate \
+    && cmake -S /opt/libdeflate -B /opt/libdeflate/build -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /opt/libdeflate/build -j$(nproc) \
+    && cmake --install /opt/libdeflate/build
+
+# htslib >= 1.15 (RabbitBAM dependency)
+RUN git clone --depth 1 --branch 1.21 https://github.com/samtools/htslib.git /opt/htslib \
+    && cd /opt/htslib \
+    && git submodule update --init --recursive \
+    && autoreconf -i \
+    && ./configure --prefix=/usr/local --with-libdeflate \
+    && make -j$(nproc) \
+    && make install
+
+# RabbitBAM
+RUN git clone https://github.com/RabbitBio/RabbitBAM.git /opt/RabbitBAM
+
+WORKDIR /opt/RabbitBAM
+SHELL ["/bin/bash", "-c"]
+
+RUN bash configure.sh /usr/local /usr/local \
+    && source env.sh \
+    && make clean \
+    && make -j$(nproc)
+
+# Stage 3: runtime image with samtools + python3-pysam + RabbitBAM
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     samtools \
     python3 \
     python3-pysam \
+    zlib1g \
+    libbz2-1.0 \
+    liblzma5 \
+    libcurl4 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy compiled binary from builder
+# bamstrom counter
 COPY --from=builder /build/target/release/bench_count /app/bench_count
 
-# Copy benchmark script
+# RabbitBAM binary + its shared libs
+COPY --from=rabbitbam-builder /opt/RabbitBAM/rabbitbam /opt/RabbitBAM/rabbitbam
+COPY --from=rabbitbam-builder /opt/RabbitBAM/librabbitbam*.so /opt/RabbitBAM/
+
+# htslib / libdeflate shared libs needed at runtime
+COPY --from=rabbitbam-builder /usr/local/lib/libhts.so* /usr/local/lib/
+COPY --from=rabbitbam-builder /usr/local/lib/libdeflate.so* /usr/local/lib/
+
+RUN ldconfig
+
+ENV LD_LIBRARY_PATH=/opt/RabbitBAM:/usr/local/lib
+
+# Benchmark script
 COPY bench/bench.py /app/bench.py
 
 # Test data is mounted at runtime; nothing to COPY here.

@@ -31,7 +31,8 @@ try:
 except ImportError:
     HAS_PYSAM = False
 
-BENCH_COUNT_BIN = "/app/bench_count"
+BENCH_COUNT_BIN  = "/app/bench_count"
+RABBITBAM_BIN    = "/opt/RabbitBAM/rabbitbam"
 DEFAULT_CONFIG   = Path(__file__).parent / "bench.toml"
 
 # ── config loading ────────────────────────────────────────────────────────────
@@ -95,6 +96,18 @@ def run_samtools(bam: str, threads: int) -> tuple[float, int]:
     return time.perf_counter() - t0, int(result.stdout.strip())
 
 
+def run_rabbitbam(bam: str, threads: int) -> tuple[float, int]:
+    cmd = [RABBITBAM_BIN, "benchmark_count", "-i", bam, "-w", str(threads)]
+    t0 = time.perf_counter()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"rabbitbam failed (exit {exc.returncode}):\n{exc.stderr.strip()}"
+        ) from exc
+    return time.perf_counter() - t0, int(result.stdout.strip())
+
+
 def run_pysam(bam: str) -> tuple[float, int]:
     t0 = time.perf_counter()
     with pysam.AlignmentFile(bam, "rb", check_sq=False) as f:
@@ -133,12 +146,16 @@ def main() -> None:
     cfg = load_config(Path(args.config))
     max_cpus = os.cpu_count() or 1
 
-    bamstrom_threads = resolve_threads(
-        cfg.get("bamstrom", {}).get("threads", [1, 2, 4, 8, 0]),
+    bamstrom_threads  = resolve_threads(
+        cfg.get("bamstrom",  {}).get("threads", [1, 2, 4, 8, 0]),
         max_cpus,
     )
-    samtools_threads = resolve_threads(
-        cfg.get("samtools", {}).get("threads", [1, 0]),
+    samtools_threads  = resolve_threads(
+        cfg.get("samtools",  {}).get("threads", [1, 0]),
+        max_cpus,
+    )
+    rabbitbam_threads = resolve_threads(
+        cfg.get("rabbitbam", {}).get("threads", [1, 2, 4, 8, 0]),
         max_cpus,
     )
     repeats    = args.repeats    if args.repeats    is not None else cfg.get("benchmark", {}).get("repeats",    3)
@@ -151,8 +168,9 @@ def main() -> None:
     print(f"BAM file : {args.bam}  ({bam_mb:.1f} MB)")
     print(f"CPU cores: {max_cpus}")
     print(f"Repeats  : {repeats}  (best of N reported)")
-    print(f"bamstrom threads: {bamstrom_threads}")
-    print(f"samtools threads: {samtools_threads}")
+    print(f"bamstrom threads:  {bamstrom_threads}")
+    print(f"samtools threads:  {samtools_threads}")
+    print(f"rabbitbam threads: {rabbitbam_threads}")
     print()
     print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
     print("  " + "-" * 75)
@@ -186,6 +204,18 @@ def main() -> None:
             row = fmt_row("samtools view -c", t, elapsed, count, bam_mb)
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             row = f"  {'samtools view -c':<28}  threads={t:<4}  ERROR: {e}"
+        print(row)
+        results.append(row)
+
+    # rabbitbam
+    print()
+    print("  [rabbitbam]")
+    for t in rabbitbam_threads:
+        try:
+            elapsed, count = timed_best(run_rabbitbam, args.bam, t)
+            row = fmt_row("rabbitbam benchmark_count", t, elapsed, count, bam_mb)
+        except (RuntimeError, FileNotFoundError) as e:
+            row = f"  {'rabbitbam benchmark_count':<28}  threads={t:<4}  ERROR: {e}"
         print(row)
         results.append(row)
 

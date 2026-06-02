@@ -1,5 +1,5 @@
 use bamstrom::bai_parser::{get_linear_indexes, get_linear_intervals};
-use bamstrom::bam_parser::{get_entire_bam_intervals, read_bam_by_interval};
+use bamstrom::bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals};
 use rayon::prelude::*;
 use std::io;
 
@@ -47,15 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let count: u64 = all_intervals
         .into_par_iter()
-        .map(|(start, end)| -> io::Result<u64> {
-            let mut reader = read_bam_by_interval(bam_path, start, end)?;
-            let mut n = 0u64;
-            for result in reader.records() {
-                result?;
-                n += 1;
-            }
-            Ok(n)
-        })
+        .map(|(start, end)| count_records_in_virtual_range(bam_path, start, end))
         .sum::<io::Result<u64>>()?;
 
     println!("{count}");

@@ -37,6 +37,44 @@ pub fn read_bam_by_interval(
     Ok(bam::io::Reader::from(decoder))
 }
 
+/// Counts BAM records whose virtual start position falls in [start, end).
+///
+/// Unlike `read_bam_by_interval`, this uses a live seeked BGZF reader rather than a
+/// pre-loaded byte slice. Pre-loading [start.compressed(), end.compressed()) bytes into a
+/// Cursor causes UnexpectedEof whenever a record *starts* before end but its bytes spill
+/// into the next BGZF block. With a live reader the block boundary is crossed transparently,
+/// and we stop counting by checking virtual_position() *before* each record read.
+pub fn count_records_in_virtual_range(
+    bam_path: &str,
+    start: VirtualPosition,
+    end: VirtualPosition,
+) -> io::Result<u64> {
+    let mut bgzf = bgzf_io::Reader::new(File::open(bam_path)?);
+    bgzf.seek(start)?;
+
+    let mut n = 0u64;
+    let mut block_size_buf = [0u8; 4];
+    let mut record_data = Vec::new();
+
+    loop {
+        if bgzf.virtual_position() >= end {
+            break;
+        }
+        // 4-byte LE u32 block_size field that begins every BAM record
+        match bgzf.read_exact(&mut block_size_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let block_size = u32::from_le_bytes(block_size_buf) as usize;
+        record_data.resize(block_size, 0);
+        bgzf.read_exact(&mut record_data)?;
+        n += 1;
+    }
+
+    Ok(n)
+}
+
 pub fn read_through_intervals(
     bam_path: &str,
     intervals: &[(VirtualPosition, VirtualPosition)],

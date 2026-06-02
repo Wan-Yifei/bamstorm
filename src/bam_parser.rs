@@ -87,6 +87,20 @@ pub fn read_through_intervals(
         .collect()
 }
 
+/// Returns the virtual position immediately after the BAM header.
+///
+/// VirtualPosition(0,0) is a BAI null sentinel that falls inside the BAM header, not
+/// on a real record. Any interval whose start is VirtualPosition(0,0) must be adjusted
+/// to this position so that count_records_in_virtual_range does not parse header bytes
+/// as record data.
+fn header_end_vpos(bam_path: &str) -> io::Result<VirtualPosition> {
+    let file = File::open(bam_path)?;
+    let bgzf = bgzf_io::Reader::new(file);
+    let mut bam_reader = bam::io::Reader::from(bgzf);
+    bam_reader.read_header()?;
+    Ok(bam_reader.get_ref().virtual_position())
+}
+
 /// Returns all BAI-derived intervals extended with the tail interval [last_end → EOF].
 /// The tail interval captures records beyond the last linear index entry, and is now
 /// included in the same parallel pass as the other intervals (Step 5+6).
@@ -106,6 +120,13 @@ pub fn get_entire_bam_intervals(
     let eof_vpos = VirtualPosition::new(eof_compressed, 0)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BAM file too large"))?;
     let mut all = intervals.to_vec();
+    // VirtualPosition(0,0) is the BAI null sentinel and always falls within the BAM
+    // header. Replace it with the true start of the first record so that
+    // count_records_in_virtual_range does not misparse header bytes as a record.
+    let zero = VirtualPosition::new(0, 0).unwrap();
+    if all.first().map(|&(start, _)| start == zero).unwrap_or(false) {
+        all[0].0 = header_end_vpos(bam_path)?;
+    }
     if last_end.compressed() < eof_compressed {
         all.push((last_end, eof_vpos));
     }

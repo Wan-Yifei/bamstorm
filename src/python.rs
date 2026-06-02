@@ -106,10 +106,15 @@ pub struct BamRecord {
 #[pymethods]
 impl BamRecord {
     fn __repr__(&self) -> String {
-        format!(
-            "BamRecord(query_name={:?}, flag={}, ref_start={:?})",
-            self.query_name, self.flag, self.reference_start
-        )
+        let name = match &self.query_name {
+            Some(n) => format!("{:?}", n),
+            None => "None".to_string(),
+        };
+        let ref_start = match self.reference_start {
+            Some(p) => p.to_string(),
+            None => "None".to_string(),
+        };
+        format!("BamRecord(query_name={}, flag={}, ref_start={})", name, self.flag, ref_start)
     }
 
     #[getter] fn is_paired(&self) -> bool       { self.flag & 0x001 != 0 }

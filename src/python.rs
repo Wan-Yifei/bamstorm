@@ -36,9 +36,13 @@ fn extract_cigar_seq(header: &noodles_sam::Header, rec: &RecordBuf) -> (String, 
 
 // ── count ─────────────────────────────────────────────────────────────────────
 
-/// Count all records; stays entirely in Rust — no Python object overhead.
+/// Count records; stays entirely in Rust — no Python object overhead.
+///
+/// until_eof=False (default): mapped reads only, matching pysam.AlignmentFile.count()
+/// until_eof=True:            all reads including unmapped, matching pysam count(until_eof=True)
 #[pyfunction]
-pub fn count(bam_path: &str, bai_path: &str) -> PyResult<u64> {
+#[pyo3(signature = (bam_path, bai_path, until_eof = false))]
+pub fn count(bam_path: &str, bai_path: &str, until_eof: bool) -> PyResult<u64> {
     let intervals = get_linear_intervals(&get_linear_indexes(bai_path).map_err(to_py_err)?)
         .map_err(to_py_err)?;
     let all_intervals =
@@ -49,8 +53,11 @@ pub fn count(bam_path: &str, bai_path: &str) -> PyResult<u64> {
             let mut reader = read_bam_by_interval(bam_path, start, end)?;
             let mut n = 0u64;
             for result in reader.records() {
-                result?;
-                n += 1;
+                let record = result?;
+                // flag bit 0x4: read unmapped
+                if until_eof || record.flags().bits() & 0x4 == 0 {
+                    n += 1;
+                }
             }
             Ok(n)
         })
@@ -184,8 +191,12 @@ impl AlignmentFile {
     }
 
     /// Count records without creating Python objects — fastest for pure counting.
-    pub fn count(&self) -> PyResult<u64> {
-        count(&self.bam_path, &self.bai_path)
+    /// Matches pysam.AlignmentFile.count() semantics:
+    ///   count()             -> mapped reads only
+    ///   count(until_eof=True) -> all reads including unmapped
+    #[pyo3(signature = (until_eof = false))]
+    pub fn count(&self, until_eof: bool) -> PyResult<u64> {
+        count(&self.bam_path, &self.bai_path, until_eof)
     }
 
     /// Read all intervals in parallel; field decoding in Rust, Python objects

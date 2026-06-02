@@ -202,6 +202,41 @@ mod test {
         Ok(())
     }
 
+    // count_records_in_virtual_range must agree with the standard sequential reader.
+    // This is the primary correctness gate for bench_count: if it fails here the
+    // parallel count against full.bam will also be wrong.
+    #[test]
+    fn test_count_records_in_virtual_range_matches_standard(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use rayon::prelude::*;
+
+        let linear_indexes = get_linear_indexes(TEST_BAI)?;
+
+        // Verify: are there VirtualPosition::MIN (zero) entries in the raw linear index?
+        // Zero entries (empty BAI windows) must not be fed to count_records_in_virtual_range
+        // as the first interval, or the BAM header bytes get parsed as a fake record.
+        let has_zero = linear_indexes
+            .iter()
+            .any(|vp| *vp == VirtualPosition::new(0, 0).unwrap());
+        // Print for diagnostic purposes (does not fail the test).
+        println!("linear index contains VirtualPosition(0,0) entries: {has_zero}");
+
+        let intervals = get_linear_intervals(&linear_indexes)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+
+        let parallel_count: u64 = all
+            .into_par_iter()
+            .map(|(start, end)| count_records_in_virtual_range(TEST_BAM, start, end))
+            .sum::<io::Result<u64>>()?;
+
+        let standard_count = crate::count_from_standard_bam_reader(TEST_BAM, 1)?;
+        assert_eq!(
+            parallel_count, standard_count,
+            "count_records_in_virtual_range total must match standard reader"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore]
     fn test_bam_read_by_interval() -> Result<(), Box<dyn std::error::Error>> {

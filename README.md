@@ -35,9 +35,18 @@ maturin develop --release --features python
 ```python
 import bamstrom
 
-# Fast parallel record count — stays entirely in Rust, no Python overhead
-n = bamstrom.count("sample.bam", "sample.bam.bai")
-print(f"{n} records")
+# Mapped reads only — matches pysam.AlignmentFile.count()
+mapped = bamstrom.count("sample.bam", "sample.bam.bai")
+
+# All reads including unmapped — matches pysam.AlignmentFile.count(until_eof=True)
+total = bamstrom.count("sample.bam", "sample.bam.bai", until_eof=True)
+
+print(f"mapped={mapped}  total={total}  unmapped={total - mapped}")
+
+# Same API on AlignmentFile
+with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+    mapped = af.count()
+    total  = af.count(until_eof=True)
 
 # Iterate over records
 with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
@@ -45,10 +54,6 @@ with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
         if read.is_unmapped:
             continue
         print(read.query_name, read.reference_start, read.cigarstring)
-
-# .count() method on AlignmentFile
-with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
-    print(af.count())
 ```
 
 ### `BamRecord` attributes
@@ -97,14 +102,19 @@ bamstrom and pysam are complementary. bamstrom accelerates bulk IO; pysam provid
 ### Drop-in replacement for counting
 
 ```python
-# pysam — single-threaded, slow on large files
 import pysam
-with pysam.AlignmentFile("sample.bam", "rb") as af:
-    n = sum(1 for _ in af.fetch(until_eof=True))
-
-# bamstrom — parallel, no Python object overhead
 import bamstrom
-n = bamstrom.count("sample.bam", "sample.bam.bai")
+
+# Mapped reads
+with pysam.AlignmentFile("sample.bam", "rb") as af:
+    n = af.count()                                           # pysam
+n = bamstrom.count("sample.bam", "sample.bam.bai")          # bamstrom — parallel equivalent
+
+# All reads (including unmapped)
+with pysam.AlignmentFile("sample.bam", "rb") as af:
+    n = af.count(until_eof=True)                             # pysam
+n = bamstrom.count("sample.bam", "sample.bam.bai",
+                   until_eof=True)                           # bamstrom — parallel equivalent
 ```
 
 ### Pre-filter with bamstrom, then process with pysam
@@ -136,7 +146,8 @@ with pysam.AlignmentFile("sample.bam", "rb") as af:
 
 | Task | Recommended |
 |------|-------------|
-| Count all records | `bamstrom.count()` |
+| Count mapped reads | `bamstrom.count()` |
+| Count all reads (incl. unmapped) | `bamstrom.count(until_eof=True)` |
 | Bulk flag filtering | `bamstrom.AlignmentFile` |
 | Simple field access (name, flag, pos, CIGAR, seq) | `bamstrom.AlignmentFile` |
 | Random-access fetch by genomic region | pysam |

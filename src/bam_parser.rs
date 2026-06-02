@@ -60,10 +60,17 @@ pub fn get_entire_bam_intervals(
         .last()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "intervals is empty"))?;
     let file_size = File::open(bam_path)?.metadata()?.len();
-    let eof_vpos = VirtualPosition::new(file_size, 0)
+    // Every valid BGZF/BAM file ends with a 28-byte empty EOF block that contains no
+    // BAM data. Using file_size as the upper bound includes this block, causing
+    // MultithreadedReader to return UnexpectedEof when records() tries to read past it.
+    const BGZF_EOF_LEN: u64 = 28;
+    let eof_compressed = file_size.saturating_sub(BGZF_EOF_LEN);
+    let eof_vpos = VirtualPosition::new(eof_compressed, 0)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BAM file too large"))?;
     let mut all = intervals.to_vec();
-    all.push((last_end, eof_vpos));
+    if last_end.compressed() < eof_compressed {
+        all.push((last_end, eof_vpos));
+    }
     Ok(all)
 }
 

@@ -101,7 +101,7 @@ def drop_caches() -> None:
     try:
         with open("/proc/sys/vm/drop_caches", "w") as fh:
             fh.write("1\n")
-    except (PermissionError, FileNotFoundError):
+    except OSError:
         pass
 
 

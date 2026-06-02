@@ -109,6 +109,61 @@ mod test {
     use crate::bai_parser::{get_linear_indexes, get_linear_intervals};
     use crate::timer::timeit;
 
+    const TEST_BAM: &str = "tests/mt.sorted.bam";
+    const TEST_BAI: &str = "tests/mt.sorted.bam.bai";
+
+    // Tail interval is appended and its end sits exactly at file_size - 28 (the BGZF EOF block).
+    #[test]
+    fn test_get_entire_bam_intervals_appends_tail() -> Result<(), Box<dyn std::error::Error>> {
+        let file_size = std::fs::metadata(TEST_BAM)?.len();
+        let expected_eof_compressed = file_size - 28;
+
+        let intervals = get_linear_intervals(&get_linear_indexes(TEST_BAI)?)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+
+        assert_eq!(all.len(), intervals.len() + 1, "tail interval should be appended");
+        assert_eq!(
+            all.last().unwrap().1.compressed(),
+            expected_eof_compressed,
+            "tail end must stop before the BGZF EOF block"
+        );
+        Ok(())
+    }
+
+    // When last_end already sits at the BGZF EOF boundary no tail interval is added.
+    #[test]
+    fn test_get_entire_bam_intervals_skips_tail_at_eof_boundary(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file_size = std::fs::metadata(TEST_BAM)?.len();
+        let eof_compressed = file_size - 28;
+
+        let start = VirtualPosition::new(0, 0).unwrap();
+        let last_end = VirtualPosition::new(eof_compressed, 0).unwrap();
+        let intervals = vec![(start, last_end)];
+
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+
+        assert_eq!(all.len(), intervals.len(), "no tail should be added when last_end is at EOF boundary");
+        Ok(())
+    }
+
+    // Regression: iterating all intervals must not produce UnexpectedEof.
+    // Previously the BGZF EOF block (28 bytes, zero payload) was included in the
+    // tail interval, causing MultithreadedReader::records() to fail.
+    #[test]
+    fn test_get_entire_bam_intervals_no_eof_error() -> Result<(), Box<dyn std::error::Error>> {
+        let intervals = get_linear_intervals(&get_linear_indexes(TEST_BAI)?)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+
+        for (start, end) in all {
+            let mut reader = read_bam_by_interval(TEST_BAM, start, end)?;
+            for result in reader.records() {
+                result?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore]
     fn test_bam_read_by_interval() -> Result<(), Box<dyn std::error::Error>> {

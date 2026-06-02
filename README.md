@@ -90,6 +90,64 @@ let intervals = get_linear_intervals(&indexes)?;
 let total = count_all_records("sample.bam", &intervals)?;
 ```
 
+## Working alongside pysam
+
+bamstrom and pysam are complementary. bamstrom accelerates bulk IO; pysam provides flexible record manipulation, random-access region queries, and full tag support.
+
+### Drop-in replacement for counting
+
+```python
+# pysam — single-threaded, slow on large files
+import pysam
+with pysam.AlignmentFile("sample.bam", "rb") as af:
+    n = sum(1 for _ in af.fetch(until_eof=True))
+
+# bamstrom — parallel, no Python object overhead
+import bamstrom
+n = bamstrom.count("sample.bam", "sample.bam.bai")
+```
+
+### Pre-filter with bamstrom, then process with pysam
+
+Use bamstrom to quickly collect read names or flags that pass a criterion, then re-fetch only those reads with pysam for detailed processing.
+
+```python
+import bamstrom
+import pysam
+
+# Step 1: fast parallel scan — collect names of mapped, non-duplicate reads
+keep = set()
+with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+    for read in af:
+        if not read.is_unmapped and not read.is_duplicate:
+            keep.add(read.query_name)
+
+print(f"keeping {len(keep)} reads")
+
+# Step 2: pysam for full tag access on the filtered set
+with pysam.AlignmentFile("sample.bam", "rb") as af:
+    for read in af.fetch(until_eof=True):
+        if read.query_name in keep:
+            cb = read.get_tag("CB") if read.has_tag("CB") else None
+            # ... complex processing
+```
+
+### When to use each
+
+| Task | Recommended |
+|------|-------------|
+| Count all records | `bamstrom.count()` |
+| Bulk flag filtering | `bamstrom.AlignmentFile` |
+| Simple field access (name, flag, pos, CIGAR, seq) | `bamstrom.AlignmentFile` |
+| Random-access fetch by genomic region | pysam |
+| Full tag access (`get_tag`, `get_tags`) | pysam |
+| Writing / modifying BAM files | bamstrom Rust API or pysam |
+| Complex per-read logic using pysam's full API | pysam |
+
+### Note on object compatibility
+
+`bamstrom.BamRecord` and `pysam.AlignedSegment` are separate types — you cannot pass a `BamRecord` directly to pysam APIs. For operations that require pysam's full `AlignedSegment` interface, use pysam directly. A `.to_pysam()` conversion method is planned for a future release.
+
 ## Benchmark
 
 Run the Docker-based benchmark comparing bamstrom against samtools and pysam:

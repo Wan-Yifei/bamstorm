@@ -15,6 +15,7 @@ RUN cargo build --release --bin bench_count
 FROM debian:bookworm-slim AS rabbitbam-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
     make \
     g++ \

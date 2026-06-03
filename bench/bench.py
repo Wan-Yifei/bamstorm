@@ -105,7 +105,13 @@ def run_rabbitbam(bam: str, threads: int) -> tuple[float, int]:
         raise RuntimeError(
             f"rabbitbam failed (exit {exc.returncode}):\n{exc.stderr.strip()}"
         ) from exc
-    return time.perf_counter() - t0, int(result.stdout.strip())
+    elapsed = time.perf_counter() - t0
+    for line in result.stdout.splitlines():
+        if line.startswith("Bam number is"):
+            return elapsed, int(line.split()[-1])
+    raise RuntimeError(
+        f"rabbitbam output missing 'Bam number is' line:\n{result.stdout.strip()}"
+    )
 
 
 def run_pysam(bam: str) -> tuple[float, int]:

@@ -61,6 +61,7 @@ pub fn count_all_records(
     intervals: &[(VirtualPosition, VirtualPosition)],
 ) -> io::Result<u64> {
     let all_intervals = bam_parser::get_entire_bam_intervals(bam_path, intervals)?;
+    let all_intervals = bam_parser::merge_intervals(&all_intervals, rayon::current_num_threads());
     let total_records: u64 = all_intervals
         .into_par_iter()
         .map(|(start, end)| -> io::Result<u64> {

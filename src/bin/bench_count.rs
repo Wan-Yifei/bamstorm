@@ -1,5 +1,5 @@
 use bamstrom::bai_parser::{get_linear_indexes, get_linear_intervals};
-use bamstrom::bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals};
+use bamstrom::bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals, merge_intervals};
 use rayon::prelude::*;
 use std::io;
 
@@ -44,6 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let linear_indexes = get_linear_indexes(bai_path)?;
     let intervals = get_linear_intervals(&linear_indexes)?;
     let all_intervals = get_entire_bam_intervals(bam_path, &intervals)?;
+    let effective_threads = if threads > 0 { threads } else { rayon::current_num_threads() };
+    let all_intervals = merge_intervals(&all_intervals, effective_threads);
 
     if verbose {
         // Check for gap before the first interval (reads between header and first index entry)

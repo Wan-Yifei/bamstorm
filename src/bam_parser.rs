@@ -87,6 +87,49 @@ pub fn read_through_intervals(
         .collect()
 }
 
+/// Merges consecutive intervals into at most `max_chunks` larger intervals.
+///
+/// Consecutive BAI-derived intervals are always contiguous in compressed space
+/// (end_i == start_{i+1}), so merging extends ranges without gaps. Reducing
+/// 3000+ intervals to O(thread_count) intervals cuts seek overhead from
+/// O(intervals) to O(threads), which is the dominant cost at low thread counts.
+///
+/// Chunks are sized by compressed byte span so each thread gets roughly equal
+/// IO work. Returns the input unchanged when `intervals.len() <= max_chunks`.
+pub fn merge_intervals(
+    intervals: &[(VirtualPosition, VirtualPosition)],
+    max_chunks: usize,
+) -> Vec<(VirtualPosition, VirtualPosition)> {
+    if intervals.is_empty() || max_chunks == 0 {
+        return Vec::new();
+    }
+    if intervals.len() <= max_chunks {
+        return intervals.to_vec();
+    }
+
+    let first_start = intervals[0].0.compressed();
+    let last_end = intervals[intervals.len() - 1].1.compressed();
+    let total_bytes = last_end.saturating_sub(first_start);
+    let bytes_per_chunk = (total_bytes + max_chunks as u64 - 1) / max_chunks as u64;
+
+    let mut merged: Vec<(VirtualPosition, VirtualPosition)> = Vec::with_capacity(max_chunks);
+    let mut chunk_start = intervals[0].0;
+    let mut boundary = first_start + bytes_per_chunk;
+
+    for (i, &(_, end)) in intervals.iter().enumerate() {
+        let is_last = i == intervals.len() - 1;
+        if end.compressed() >= boundary || is_last {
+            merged.push((chunk_start, end));
+            if !is_last {
+                chunk_start = intervals[i + 1].0;
+                boundary = end.compressed() + bytes_per_chunk;
+            }
+        }
+    }
+
+    merged
+}
+
 /// Returns the virtual position immediately after the BAM header.
 ///
 /// VirtualPosition(0,0) is a BAI null sentinel that falls inside the BAM header, not
@@ -254,6 +297,54 @@ mod test {
         assert_eq!(
             parallel_count, standard_count,
             "count_records_in_virtual_range total must match standard reader"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_intervals_reduces_to_max_chunks() {
+        let vp = |c: u64| VirtualPosition::new(c, 0).unwrap();
+        // 10 contiguous intervals spanning compressed offsets 0..10
+        let intervals: Vec<(VirtualPosition, VirtualPosition)> =
+            (0u64..10).map(|i| (vp(i), vp(i + 1))).collect();
+
+        let merged = merge_intervals(&intervals, 3);
+        assert!(merged.len() <= 3, "should produce at most 3 chunks");
+        // First chunk starts at same position as first interval
+        assert_eq!(merged[0].0.compressed(), 0);
+        // Last chunk ends at same position as last interval
+        assert_eq!(merged.last().unwrap().1.compressed(), 10);
+    }
+
+    #[test]
+    fn test_merge_intervals_noop_when_fewer_than_max() {
+        let vp = |c: u64| VirtualPosition::new(c, 0).unwrap();
+        let intervals: Vec<_> = (0u64..5).map(|i| (vp(i), vp(i + 1))).collect();
+        let merged = merge_intervals(&intervals, 10);
+        assert_eq!(merged.len(), intervals.len());
+    }
+
+    #[test]
+    fn test_merge_intervals_count_matches_standard() -> Result<(), Box<dyn std::error::Error>> {
+        use rayon::prelude::*;
+
+        let linear_indexes = get_linear_indexes(TEST_BAI)?;
+        let intervals = get_linear_intervals(&linear_indexes)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+
+        // Merge into 2 chunks (stress-tests large merged intervals)
+        let merged = merge_intervals(&all, 2);
+        assert!(merged.len() <= 2);
+
+        let merged_count: u64 = merged
+            .into_par_iter()
+            .map(|(start, end)| count_records_in_virtual_range(TEST_BAM, start, end))
+            .sum::<io::Result<u64>>()?;
+
+        let standard_count = crate::count_from_standard_bam_reader(TEST_BAM, 1)?;
+        assert_eq!(
+            merged_count, standard_count,
+            "merged intervals count must match standard reader"
         );
         Ok(())
     }

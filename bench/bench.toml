@@ -1,0 +1,23 @@
+# Benchmark configuration for bamstrom vs samtools vs pysam.
+# Edit this file to control which thread counts are tested.
+# 0 is a special value meaning "use all available CPU cores".
+
+[bamstrom]
+# Thread counts passed to bench_count --threads N.
+# Covers single-core baseline, common parallelism levels, and full CPU.
+threads = [1, 2, 4, 8, 0]
+
+[samtools]
+# Thread counts passed to samtools --threads N.
+threads = [1, 0]
+
+[rabbitbam]
+# Thread counts passed to rabbitbam benchmark_count -w N.
+threads = [1, 2, 4, 8, 0]
+
+[benchmark]
+# Number of timed repetitions per configuration; the best (fastest) time is reported.
+repeats = 3
+# Drop OS page cache before each run for cold-cache IO measurement.
+# Requires root on Linux; silently skipped otherwise.
+drop_cache = true

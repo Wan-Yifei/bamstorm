@@ -238,3 +238,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Added by cargo
+
+/target
+
+### Bioinformatics ignore list
+*.bam
+*.bai
+*.sam
+
+### Local config
+# Machine-specific linker flags — not portable across installations
+.cargo/
+# AI assistant local memory
+.claude/

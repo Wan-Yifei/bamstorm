@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BAM reader benchmark: bamstrom vs samtools vs pysam.
+BAM reader benchmark: bamstrom vs samtools vs rabbitbam vs pysam.
 
 Metrics per run:
   - Wall-clock elapsed time (seconds)
@@ -12,8 +12,10 @@ CLI flags override config values for one-off runs.
 """
 
 import argparse
+import csv
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -39,7 +41,7 @@ DEFAULT_CONFIG   = Path(__file__).parent / "bench.toml"
 
 def load_config(path: Path) -> dict:
     if tomllib is None:
-        print(f"[warn] tomllib not available — using built-in defaults")
+        print("[warn] tomllib not available — using built-in defaults")
         return {}
     try:
         with open(path, "rb") as fh:
@@ -60,18 +62,27 @@ def resolve_threads(thread_list: list[int], max_cpus: int) -> list[int]:
     return result
 
 
+def tool_threads(cfg: dict, tool: str, default: list[int], max_cpus: int) -> list[int]:
+    """Return per-tool thread list, falling back to default."""
+    override = cfg.get(tool, {}).get("threads")
+    return resolve_threads(override if override is not None else default, max_cpus)
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def file_mb(path: str) -> float:
     return os.path.getsize(path) / (1024 * 1024)
 
 
-def fmt_row(label: str, threads: int | str, elapsed: float,
-            count: int, bam_mb: float) -> str:
-    throughput = bam_mb / elapsed if elapsed > 0 else float("inf")
+def fmt_row(r: dict, bam_mb: float) -> str:
+    if "error" in r:
+        return (
+            f"  {r['tool']:<28}  threads={str(r['threads']):<4}  ERROR: {r['error']}"
+        )
+    throughput = bam_mb / r["elapsed"] if r["elapsed"] > 0 else float("inf")
     return (
-        f"  {label:<28}  threads={str(threads):<4}  "
-        f"{elapsed:7.3f}s  {throughput:8.1f} MB/s  records={count}"
+        f"  {r['tool']:<28}  threads={str(r['threads']):<4}  "
+        f"{r['elapsed']:7.3f}s  {throughput:8.1f} MB/s  records={r['records']}"
     )
 
 
@@ -114,9 +125,9 @@ def run_rabbitbam(bam: str, threads: int) -> tuple[float, int]:
     )
 
 
-def run_pysam(bam: str) -> tuple[float, int]:
+def run_pysam(bam: str, threads: int) -> tuple[float, int]:
     t0 = time.perf_counter()
-    with pysam.AlignmentFile(bam, "rb", check_sq=False) as f:
+    with pysam.AlignmentFile(bam, "rb", check_sq=False, threads=threads) as f:
         n = sum(1 for _ in f.fetch(until_eof=True))
     return time.perf_counter() - t0, n
 
@@ -147,25 +158,24 @@ def main() -> None:
         "--no-drop-cache", action="store_true", default=None,
         help="Override config: skip dropping OS page cache between runs",
     )
+    parser.add_argument(
+        "--csv", metavar="FILE",
+        help="Write results to CSV file (use '-' for stdout)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
     max_cpus = os.cpu_count() or 1
 
-    bamstrom_threads  = resolve_threads(
-        cfg.get("bamstrom",  {}).get("threads", [1, 2, 4, 8, 0]),
-        max_cpus,
-    )
-    samtools_threads  = resolve_threads(
-        cfg.get("samtools",  {}).get("threads", [1, 0]),
-        max_cpus,
-    )
-    rabbitbam_threads = resolve_threads(
-        cfg.get("rabbitbam", {}).get("threads", [1, 2, 4, 8, 0]),
-        max_cpus,
-    )
-    repeats    = args.repeats    if args.repeats    is not None else cfg.get("benchmark", {}).get("repeats",    3)
-    drop_cache = (not args.no_drop_cache)           if args.no_drop_cache is not None \
+    default_threads = cfg.get("benchmark", {}).get("threads", [1, 2, 4, 8, 0])
+    bamstrom_threads  = tool_threads(cfg, "bamstrom",  default_threads, max_cpus)
+    samtools_threads  = tool_threads(cfg, "samtools",  default_threads, max_cpus)
+    rabbitbam_threads = tool_threads(cfg, "rabbitbam", default_threads, max_cpus)
+    pysam_threads     = tool_threads(cfg, "pysam",     default_threads, max_cpus)
+
+    repeats    = args.repeats if args.repeats is not None \
+                 else cfg.get("benchmark", {}).get("repeats", 3)
+    drop_cache = (not args.no_drop_cache) if args.no_drop_cache is not None \
                  else cfg.get("benchmark", {}).get("drop_cache", True)
 
     bam_mb = file_mb(args.bam)
@@ -174,14 +184,13 @@ def main() -> None:
     print(f"BAM file : {args.bam}  ({bam_mb:.1f} MB)")
     print(f"CPU cores: {max_cpus}")
     print(f"Repeats  : {repeats}  (best of N reported)")
-    print(f"bamstrom threads:  {bamstrom_threads}")
-    print(f"samtools threads:  {samtools_threads}")
-    print(f"rabbitbam threads: {rabbitbam_threads}")
+    print(f"threads  : {default_threads} (bamstrom={bamstrom_threads} samtools={samtools_threads} "
+          f"rabbitbam={rabbitbam_threads} pysam={pysam_threads})")
     print()
     print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
     print("  " + "-" * 75)
 
-    results: list[str] = []
+    results: list[dict] = []
 
     def timed_best(fn, *fn_args) -> tuple[float, int]:
         best, count = float("inf"), 0
@@ -193,13 +202,24 @@ def main() -> None:
                 best = elapsed
         return best, count
 
+    def record_ok(tool: str, threads: int, elapsed: float, count: int) -> dict:
+        return {"tool": tool, "threads": threads, "elapsed": elapsed,
+                "throughput": bam_mb / elapsed if elapsed > 0 else float("inf"),
+                "records": count}
+
+    def record_err(tool: str, threads: int, error: str) -> dict:
+        return {"tool": tool, "threads": threads, "error": error}
+
     # bamstrom
     print("  [bamstrom]")
     for t in bamstrom_threads:
-        elapsed, count = timed_best(run_bamstrom, args.bam, args.bai, t)
-        row = fmt_row("bamstrom", t, elapsed, count, bam_mb)
-        print(row)
-        results.append(row)
+        try:
+            elapsed, count = timed_best(run_bamstrom, args.bam, args.bai, t)
+            r = record_ok("bamstrom", t, elapsed, count)
+        except Exception as e:
+            r = record_err("bamstrom", t, str(e))
+        print(fmt_row(r, bam_mb))
+        results.append(r)
 
     # samtools
     print()
@@ -207,11 +227,11 @@ def main() -> None:
     for t in samtools_threads:
         try:
             elapsed, count = timed_best(run_samtools, args.bam, t)
-            row = fmt_row("samtools view -c", t, elapsed, count, bam_mb)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            row = f"  {'samtools view -c':<28}  threads={t:<4}  ERROR: {e}"
-        print(row)
-        results.append(row)
+            r = record_ok("samtools view -c", t, elapsed, count)
+        except Exception as e:
+            r = record_err("samtools view -c", t, str(e))
+        print(fmt_row(r, bam_mb))
+        results.append(r)
 
     # rabbitbam
     print()
@@ -219,22 +239,26 @@ def main() -> None:
     for t in rabbitbam_threads:
         try:
             elapsed, count = timed_best(run_rabbitbam, args.bam, t)
-            row = fmt_row("rabbitbam benchmark_count", t, elapsed, count, bam_mb)
-        except (RuntimeError, FileNotFoundError) as e:
-            row = f"  {'rabbitbam benchmark_count':<28}  threads={t:<4}  ERROR: {e}"
-        print(row)
-        results.append(row)
+            r = record_ok("rabbitbam benchmark_count", t, elapsed, count)
+        except Exception as e:
+            r = record_err("rabbitbam benchmark_count", t, str(e))
+        print(fmt_row(r, bam_mb))
+        results.append(r)
 
     # pysam
     print()
     print("  [pysam]")
     if HAS_PYSAM:
-        elapsed, count = timed_best(run_pysam, args.bam)
-        row = fmt_row("pysam fetch(until_eof)", 1, elapsed, count, bam_mb)
+        for t in pysam_threads:
+            try:
+                elapsed, count = timed_best(run_pysam, args.bam, t)
+                r = record_ok("pysam fetch(until_eof)", t, elapsed, count)
+            except Exception as e:
+                r = record_err("pysam fetch(until_eof)", t, str(e))
+            print(fmt_row(r, bam_mb))
+            results.append(r)
     else:
-        row = "  pysam not installed — skipped"
-    print(row)
-    results.append(row)
+        print("  pysam not installed — skipped")
 
     # summary
     print()
@@ -243,9 +267,34 @@ def main() -> None:
     print("=" * 79)
     print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
     print("  " + "-" * 75)
-    for row in results:
-        print(row)
+    for r in results:
+        print(fmt_row(r, bam_mb))
     print()
+
+    # CSV output
+    if args.csv:
+        fh = sys.stdout if args.csv == "-" else open(args.csv, "w", newline="")
+        try:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=["tool", "threads", "elapsed_s", "throughput_mb_s", "records", "error"],
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for r in results:
+                writer.writerow({
+                    "tool":             r["tool"],
+                    "threads":          r["threads"],
+                    "elapsed_s":        r.get("elapsed", ""),
+                    "throughput_mb_s":  f"{r['throughput']:.1f}" if "throughput" in r else "",
+                    "records":          r.get("records", ""),
+                    "error":            r.get("error", ""),
+                })
+        finally:
+            if fh is not sys.stdout:
+                fh.close()
+        if args.csv != "-":
+            print(f"CSV written to {args.csv}")
 
 
 if __name__ == "__main__":

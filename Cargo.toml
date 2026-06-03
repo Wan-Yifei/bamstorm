@@ -12,6 +12,7 @@ python = ["pyo3/extension-module"]
 
 [dependencies]
 bstr = "1.12.1"
-noodles = { version = "0.102.0", features = ["bam", "bgzf", "csi", "sam"] }
+noodles = { version = "0.111.0", features = ["bam", "bgzf", "csi", "sam"] }
+noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
 rayon = "1.11.0"
 pyo3 = { version = "0.22", features = ["abi3-py38"], optional = true }

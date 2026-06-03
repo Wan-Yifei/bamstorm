@@ -15,6 +15,10 @@ threads = [1, 0]
 # Thread counts passed to rabbitbam benchmark_count -w N.
 threads = [1, 2, 4, 8, 0]
 
+[pysam]
+# Thread counts passed to pysam AlignmentFile(threads=N).
+threads = [1, 0]
+
 [benchmark]
 # Number of timed repetitions per configuration; the best (fastest) time is reported.
 repeats = 3

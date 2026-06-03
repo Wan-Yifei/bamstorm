@@ -114,9 +114,9 @@ def run_rabbitbam(bam: str, threads: int) -> tuple[float, int]:
     )
 
 
-def run_pysam(bam: str) -> tuple[float, int]:
+def run_pysam(bam: str, threads: int) -> tuple[float, int]:
     t0 = time.perf_counter()
-    with pysam.AlignmentFile(bam, "rb", check_sq=False) as f:
+    with pysam.AlignmentFile(bam, "rb", check_sq=False, threads=threads) as f:
         n = sum(1 for _ in f.fetch(until_eof=True))
     return time.perf_counter() - t0, n
 
@@ -164,6 +164,10 @@ def main() -> None:
         cfg.get("rabbitbam", {}).get("threads", [1, 2, 4, 8, 0]),
         max_cpus,
     )
+    pysam_threads = resolve_threads(
+        cfg.get("pysam", {}).get("threads", [1, 0]),
+        max_cpus,
+    )
     repeats    = args.repeats    if args.repeats    is not None else cfg.get("benchmark", {}).get("repeats",    3)
     drop_cache = (not args.no_drop_cache)           if args.no_drop_cache is not None \
                  else cfg.get("benchmark", {}).get("drop_cache", True)
@@ -177,6 +181,7 @@ def main() -> None:
     print(f"bamstrom threads:  {bamstrom_threads}")
     print(f"samtools threads:  {samtools_threads}")
     print(f"rabbitbam threads: {rabbitbam_threads}")
+    print(f"pysam threads:     {pysam_threads}")
     print()
     print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
     print("  " + "-" * 75)
@@ -229,12 +234,18 @@ def main() -> None:
     print()
     print("  [pysam]")
     if HAS_PYSAM:
-        elapsed, count = timed_best(run_pysam, args.bam)
-        row = fmt_row("pysam fetch(until_eof)", 1, elapsed, count, bam_mb)
+        for t in pysam_threads:
+            try:
+                elapsed, count = timed_best(run_pysam, args.bam, t)
+                row = fmt_row("pysam fetch(until_eof)", t, elapsed, count, bam_mb)
+            except Exception as e:
+                row = f"  {'pysam fetch(until_eof)':<28}  threads={t:<4}  ERROR: {e}"
+            print(row)
+            results.append(row)
     else:
         row = "  pysam not installed — skipped"
-    print(row)
-    results.append(row)
+        print(row)
+        results.append(row)
 
     # summary
     print()

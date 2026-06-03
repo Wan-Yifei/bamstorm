@@ -65,7 +65,7 @@ the file into 10 MB chunks and heuristically scanning for BGZF magic bytes.
 | Read mechanism | `File::open` + `read_exact` per interval | Dedicated I/O thread, block-by-block `fread` | `pread` entire region into heap buffer |
 | I/O parallelism | Each worker reads independently | Single thread, sequential | Each worker `pread`s its own region |
 | I/O / decompress overlap | No | **Yes (pipeline)** | No |
-| mmap | No | No | **Yes** (`mfile_t`, zero-copy) |
+| mmap | No | No | BAI index only (`mfile_t`); BAM via `pread` |
 | Memory peak | All intervals loaded simultaneously | Fixed-size ring buffer | One region at a time per worker |
 
 ---
@@ -175,7 +175,7 @@ All three tools use libdeflate. The differences lie in how it is invoked:
 **Strengths**
 - Tightest record-counting inner loop (pointer arithmetic, zero copies)
 - Only tool supporting index-free parallel reading
-- mmap zero-copy eliminates one memory copy per region
+- BAI index loaded via mmap; BAM read via `pread` (file too large to map)
 - TBB work-stealing provides automatic load balancing
 
 **Weaknesses**

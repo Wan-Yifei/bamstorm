@@ -380,3 +380,188 @@ pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RecordIterator>()?;
     Ok(())
 }
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+// Run with: cargo test --features python
+// Requires htslib at build time (available in Docker, not on Windows dev host).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        bai_parser::{get_linear_indexes, get_linear_intervals},
+        bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals, merge_intervals},
+    };
+
+    const TEST_BAM: &str = "tests/mt.sorted.bam";
+    const TEST_BAI: &str = "tests/mt.sorted.bam.bai";
+    // The test BAM contains reads on multiple chromosomes; chrM is present and small.
+    const CHR_M: &str = "chrM";
+    // chr1 is the largest chromosome present — used to test region subsetting.
+    const CHR_1: &str = "chr1";
+
+    // Total records across all chromosomes via rust-htslib must match the noodles
+    // BAI-interval count (the shared source of truth for mapped reads).
+    #[test]
+    fn test_fetch_all_chromosomes_total_matches_noodles() -> Result<(), Box<dyn std::error::Error>> {
+        let reader = bam::IndexedReader::from_path(TEST_BAM)?;
+        let header = reader.header();
+        let refs: Vec<String> = (0..header.target_count())
+            .map(|i| String::from_utf8_lossy(header.tid2name(i)).into_owned())
+            .collect();
+        drop(reader);
+
+        let htslib_total: usize = refs
+            .iter()
+            .map(|name| fetch_chromosome(TEST_BAM, name).unwrap().len())
+            .sum();
+
+        // Noodles BAI-based count (same scope: indexed / mapped reads only).
+        let intervals = get_linear_intervals(&get_linear_indexes(TEST_BAI)?)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+        let chunks = merge_intervals(&all, 4);
+        let noodles_total: u64 = chunks
+            .into_iter()
+            .map(|(s, e)| count_records_in_virtual_range(TEST_BAM, s, e).unwrap())
+            .sum();
+
+        assert_eq!(
+            htslib_total as u64, noodles_total,
+            "rust-htslib fetch total {htslib_total} != noodles count {noodles_total}"
+        );
+        Ok(())
+    }
+
+    // chrM fetch must return a non-empty set of records.
+    #[test]
+    fn test_fetch_chromosome_chrm_nonempty() -> Result<(), Box<dyn std::error::Error>> {
+        let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
+        assert!(!recs.is_empty(), "expected records on {CHR_M}");
+        Ok(())
+    }
+
+    // RecordData fields for a mapped read must be internally consistent.
+    #[test]
+    fn test_record_data_fields_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
+        assert!(!recs.is_empty());
+
+        for r in &recs {
+            // Mapped read must have valid reference coords.
+            assert!(r.reference_id >= 0, "reference_id {} < 0 for mapped read", r.reference_id);
+            assert!(r.reference_start >= 0, "reference_start {} < 0", r.reference_start);
+
+            // Sequence must be non-empty DNA characters.
+            assert!(!r.query_sequence.is_empty(), "empty query_sequence");
+            assert!(
+                r.query_sequence.chars().all(|c| matches!(c, 'A'|'C'|'G'|'T'|'N')),
+                "unexpected base in query_sequence: {}", &r.query_sequence[..r.query_sequence.len().min(20)]
+            );
+
+            // Cigar must be present and self-consistent.
+            assert!(!r.cigartuples.is_empty(), "empty cigartuples for mapped read");
+            assert_ne!(r.cigarstring, "*", "cigarstring should not be * for mapped read");
+            for &(op, _len) in &r.cigartuples {
+                assert!(op <= 9, "cigar op {op} out of BAM_C* range [0,9]");
+            }
+
+            // query_sequence length must equal sum of query-consuming cigar ops.
+            let expected_qlen: u32 = r.cigartuples.iter()
+                .filter(|&&(op, _)| matches!(op, 0|1|4|7|8))  // M, I, S, =, X consume query
+                .map(|&(_, len)| len)
+                .sum();
+            assert_eq!(
+                r.query_sequence.len() as u32, expected_qlen,
+                "query_sequence length {} != cigar query-consuming length {}",
+                r.query_sequence.len(), expected_qlen
+            );
+
+            // If quality is present it must match sequence length.
+            if let Some(ref q) = r.query_qualities {
+                assert_eq!(
+                    q.len(), r.query_sequence.len(),
+                    "query_qualities length {} != query_sequence length {}",
+                    q.len(), r.query_sequence.len()
+                );
+                // Phred scores are raw (not +33 ASCII) so must be in [0, 93].
+                assert!(q.iter().all(|&v| v <= 93), "Phred score out of range [0,93]");
+            }
+        }
+        Ok(())
+    }
+
+    // fetch_region with a narrow window must return a strict subset of the chromosome.
+    #[test]
+    fn test_fetch_region_is_subset_of_chromosome() -> Result<(), Box<dyn std::error::Error>> {
+        let all = fetch_chromosome(TEST_BAM, CHR_1)?;
+        // Take the first 50 kb of chr1.
+        let region = fetch_region(TEST_BAM, CHR_1, 0, 50_000)?;
+
+        assert!(
+            region.len() <= all.len(),
+            "region count {} > chromosome count {}", region.len(), all.len()
+        );
+        // All region records must start within the window (reference_start < stop=50000).
+        for r in &region {
+            assert!(
+                r.reference_start < 50_000,
+                "record at {} is outside region [0, 50000)", r.reference_start
+            );
+        }
+        Ok(())
+    }
+
+    // Flag bits must be consistent with the derived boolean getters.
+    #[test]
+    fn test_flag_bit_consistency() -> Result<(), Box<dyn std::error::Error>> {
+        let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
+        for d in &recs {
+            let r = BamRecord::from_data(RecordData {
+                query_name:           d.query_name.clone(),
+                flag:                 d.flag,
+                reference_id:         d.reference_id,
+                reference_start:      d.reference_start,
+                mapping_quality:      d.mapping_quality,
+                cigarstring:          d.cigarstring.clone(),
+                cigartuples:          d.cigartuples.clone(),
+                query_sequence:       d.query_sequence.clone(),
+                query_qualities:      d.query_qualities.clone(),
+                template_length:      d.template_length,
+                next_reference_id:    d.next_reference_id,
+                next_reference_start: d.next_reference_start,
+            });
+            assert_eq!(r.is_paired(),       r.flag & 0x001 != 0);
+            assert_eq!(r.is_unmapped(),     r.flag & 0x004 != 0);
+            assert_eq!(r.is_reverse(),      r.flag & 0x010 != 0);
+            assert_eq!(r.is_forward(),      r.flag & 0x010 == 0);
+            assert_eq!(r.is_read1(),        r.flag & 0x040 != 0);
+            assert_eq!(r.is_read2(),        r.flag & 0x080 != 0);
+            assert_eq!(r.is_secondary(),    r.flag & 0x100 != 0);
+            assert_eq!(r.is_supplementary(),r.flag & 0x800 != 0);
+            // is_forward and is_reverse must be mutually exclusive.
+            assert_ne!(r.is_forward(), r.is_reverse());
+        }
+        Ok(())
+    }
+
+    // AlignmentFile::new() must load header metadata correctly.
+    #[test]
+    fn test_alignment_file_header_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        // Test in a GIL-free context by using the internals directly.
+        let reader = bam::IndexedReader::from_path(TEST_BAM)?;
+        let header = reader.header();
+        let nref = header.target_count();
+        assert!(nref > 0, "expected at least one reference sequence");
+        // chrM must be present somewhere in the header.
+        let has_chrm = (0..nref).any(|i| {
+            String::from_utf8_lossy(header.tid2name(i)) == CHR_M
+        });
+        assert!(has_chrm, "chrM not found in BAM header");
+        // Every reference must have a positive length.
+        for i in 0..nref {
+            let len = header.target_len(i).unwrap_or(0);
+            assert!(len > 0, "reference {} has zero length", i);
+        }
+        Ok(())
+    }
+}

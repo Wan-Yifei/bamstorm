@@ -1,7 +1,7 @@
 pub mod bai_parser;
 pub mod bam_parser;
 pub mod timer;
-#[cfg(feature = "python")]
+#[cfg(all(feature = "python", unix))]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod python;
 use bstr::{BString, ByteSlice};

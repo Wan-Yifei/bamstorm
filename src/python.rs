@@ -1,3 +1,7 @@
+// This module requires htslib which is only available on Unix (built in Docker).
+// On Windows the module is excluded via `#[cfg(all(feature = "python", unix))]` in lib.rs.
+#![cfg(unix)]
+
 use crate::{
     bai_parser::{get_linear_indexes, get_linear_intervals},
     bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals, merge_intervals},

@@ -86,8 +86,9 @@ RUN ldconfig
 
 ENV LD_LIBRARY_PATH=/opt/RabbitBAM:/usr/local/lib
 
-# Benchmark script
+# Benchmark scripts and config
 COPY bench/bench.py /app/bench.py
+COPY bench/bench.toml /app/bench.toml
 
 # Test data is mounted at runtime; nothing to COPY here.
 # Usage:

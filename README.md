@@ -2,6 +2,16 @@
 
 A high-performance parallel BAM reader for large-scale genomics workloads, written in Rust with Python bindings via PyO3.
 
+## Background and motivation
+
+The BAM format and the toolchain built around it (samtools, htslib, pysam) were designed in an era when storage was spinning disk and servers had a handful of cores. The dominant bottleneck was sequential read bandwidth, so a single-threaded IO loop made sense: one thread saturated the disk, and any extra parallelism was spent on BGZF decompression.
+
+Modern infrastructure has changed that picture. NVMe SSDs expose multiple IO queues and can sustain hundreds of thousands of IOPS with near-zero seek cost. Servers routinely ship with 32, 64, or 128 cores. Cloud instances are sold by the core-hour, so wall-clock time directly maps to cost. Yet the standard BAM IO path has not fundamentally changed — it still issues a single sequential read stream, leaving most of the available hardware idle.
+
+bamstrom is a ground-up redesign of the BAM read path for this hardware generation. Instead of one sequential stream, it uses the BAI linear index to partition the file into independent byte ranges and reads all of them concurrently — saturating multiple IO queues and all available cores simultaneously. The result is a tool that treats a 48 GB BAM file the way modern hardware expects: as a parallel IO problem, not a serial one.
+
+The practical consequence is a direct reduction in analysis cost for industrial-scale bioinformatics pipelines. A workflow that counts or scans hundreds of whole-genome BAM files per day can cut its compute footprint by 2–3× simply by replacing the IO layer, with no changes to downstream logic.
+
 ## How it works
 
 Standard tools (samtools, pysam/htslib) read BAM files with a single IO thread and decompress BGZF blocks in parallel. **bamstrom** takes a different approach: it uses the BAI linear index to split the file into independent byte-range intervals, then reads and decompresses all intervals simultaneously with rayon.
@@ -10,6 +20,41 @@ Standard tools (samtools, pysam/htslib) read BAM files with a single IO thread a
 htslib:  single fd → sequential read → parallel BGZF decompress
 bamstrom: BAI intervals → N parallel fds → parallel read + decompress
 ```
+
+## Related tools
+
+Several tools have tackled BAM parallelism before bamstrom, each with a different approach.
+
+### QuickBAM
+
+[QuickBAM](https://gitlab.com/yiq/quickbam) (C++, OpenMP / Intel TBB) uses the BAI index's fixed 16 KB bin structure as the unit of parallelism. Each bin becomes an independent work item dispatched to a thread pool. For files without an index it falls back to a heuristic scanner that locates safe parallel entry points by pattern-matching BGZF block headers.
+
+```
+BAI fixed bins → scatter work items → thread pool (OpenMP/TBB)
+                                         ├── read bin bytes
+                                         ├── BGZF decompress
+                                         └── compute (pileup, count, …)
+                                     → aggregate results
+```
+
+The key constraint is that work granularity is tied to the 16 KB bin grid; very large or skewed bins can create load-imbalance. QuickBAM reports 1.5+ GiB/s peak throughput on pileup workloads (38× faster than single-threaded baselines on the same hardware).
+
+### RabbitBAM
+
+[RabbitBAM](https://github.com/RabbitBio/RabbitBAM) (C/C++) targets the parsing bottleneck rather than the IO bottleneck. A dedicated pre-parsing stage scans the byte stream to locate record boundaries without fully decoding each record. Those boundaries are queued into lock-free queues backed by memory pools, and a pool of parser threads consumes them in parallel.
+
+```
+single fd → sequential read → BGZF decompress
+                                   → pre-parser: locate record boundaries
+                                   → lock-free queue
+                                   → parser thread pool: decode records in parallel
+```
+
+The design eliminates lock contention and copy overhead during parsing, which is the dominant cost for short-read BAMs where record count is high. RabbitBAM achieves 2.1–3.3× speedup over samtools/htslib on NGS datasets.
+
+### How bamstrom differs
+
+Both QuickBAM and RabbitBAM retain a single sequential IO stream and parallelize the work *after* bytes are read. bamstrom moves the parallelism to the IO layer itself: by splitting the file into independent byte-range intervals (derived from the BAI linear index), it opens N file descriptors and issues N concurrent read+decompress streams simultaneously. On NVMe storage this saturates multiple IO queues, something a single-stream design cannot do regardless of how many decompression threads it spawns.
 
 ## Installation
 
@@ -161,26 +206,37 @@ with pysam.AlignmentFile("sample.bam", "rb") as af:
 
 ## Benchmark
 
-Run the Docker-based benchmark comparing bamstrom against samtools and pysam:
+Tested on a 47.8 GB coordinate-sorted BAM (899,477,438 records). Best-of-3 runs, OS page cache dropped between runs.
+
+### v0.3.0 results
+
+![Benchmark v0.3.0](report_v0.3.0.png)
+
+**Throughput (MB/s) — higher is better**
+
+| Threads | bamstrom | samtools | rabbitbam | pysam |
+|--------:|---------:|---------:|----------:|------:|
+| 1       | 197      | 193      | 211       | 142   |
+| 2       | 392      | 389      | 418       | 197   |
+| 4       | 775      | 496      | 503       | 291   |
+| 8       | **988**  | 496      | 503       | 290   |
+| 128     | **997**  | 502      | 385       | 288   |
+
+Key observations:
+
+- bamstrom peaks at **~997 MB/s**, roughly **2× faster** than samtools and rabbitbam (~502 MB/s) and **3.4× faster** than pysam (~291 MB/s).
+- bamstrom scales linearly up to 8 threads (~5× over single-thread), then plateaus — the workload becomes IO-bound at that point.
+- samtools and rabbitbam plateau at 4 threads (~500 MB/s); neither benefits further from more cores.
+- rabbitbam degrades at 128 threads (384 MB/s) due to over-subscription overhead.
+- pysam is CPU-limited at all thread counts, topping out at ~291 MB/s.
+
+### Running the benchmark
 
 ```bash
-docker build -t bamstrom-bench .
-docker run --rm -v /path/to/data:/data bamstrom-bench \
-    python3 /app/bench.py /data/sample.bam /data/sample.bam.bai
+./bench/run_bench.sh /data/sample.bam /data/sample.bam.bai --csv results.csv
 ```
 
-Example output:
-
-```
-  Tool                          threads    elapsed    throughput  records
-  ---------------------------------------------------------------------------
-  bamstrom                      threads=1    3.201s    312.4 MB/s  records=45000000
-  bamstrom                      threads=4    0.891s   1121.5 MB/s  records=45000000
-  bamstrom                      threads=8    0.512s   1952.0 MB/s  records=45000000
-  samtools view -c              threads=1    9.847s    101.5 MB/s  records=45000000
-  samtools view -c              threads=8    3.201s    312.4 MB/s  records=45000000
-  pysam fetch(until_eof)        threads=1   18.234s     54.8 MB/s  records=45000000
-```
+This builds the benchmark Docker image and runs `bench.py` inside it against samtools, rabbitbam, and pysam. The `--csv` flag writes raw results to the host for plotting with `bench/plot_report.py`.
 
 ## Requirements
 

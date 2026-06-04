@@ -20,4 +20,5 @@ module-name = "bamstrom._core"
 [dependency-groups]
 dev = [
     "maturin>=1.13.3",
+    "matplotlib>=3.7.5",
 ]

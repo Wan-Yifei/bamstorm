@@ -3,6 +3,7 @@ FROM rust:slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
+    libhts-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

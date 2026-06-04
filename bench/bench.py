@@ -260,15 +260,6 @@ def main() -> None:
     else:
         print("  pysam not installed — skipped")
 
-    # summary
-    print()
-    print("=" * 79)
-    print(f"Summary (best of {repeats} runs each):")
-    print("=" * 79)
-    print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
-    print("  " + "-" * 75)
-    for r in results:
-        print(fmt_row(r, bam_mb))
     print()
 
     # CSV output

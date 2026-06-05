@@ -4,7 +4,7 @@
 
 [benchmark]
 # Unified thread counts applied to all tools unless overridden below.
-threads = [1, 2, 4, 8, 0]
+threads = [2, 4, 8, 16, 32, 64, 128]
 # Number of timed repetitions per configuration; the best (fastest) time is reported.
 repeats = 3
 # Drop OS page cache before each run for cold-cache IO measurement.
@@ -25,13 +25,13 @@ numjobs_parallel = 0
 
 # Per-tool overrides — uncomment to diverge from benchmark.threads.
 # [bamstorm]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]
 
 # [samtools]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]
 
 # [rabbitbam]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]
 
 # [pysam]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]

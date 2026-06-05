@@ -1,5 +1,5 @@
-use bamstrom::bai_parser::{get_linear_indexes, get_linear_intervals};
-use bamstrom::bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals, merge_intervals};
+use bamstorm::bai_parser::{get_linear_indexes, get_linear_intervals};
+use bamstorm::bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals, merge_intervals};
 use rayon::prelude::*;
 use std::io;
 

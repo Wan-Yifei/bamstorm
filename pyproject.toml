@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "bamstrom"
+name = "bamstorm"
 version = "0.1.0"
 requires-python = ">=3.8"
 description = "Fast parallel BAM reader with Python bindings"
@@ -15,7 +15,7 @@ classifiers = [
 [tool.maturin]
 features = ["python"]
 python-source = "python"
-module-name = "bamstrom._core"
+module-name = "bamstorm._core"
 
 [dependency-groups]
 dev = [

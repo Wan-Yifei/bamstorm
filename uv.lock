@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "bamstrom"
+name = "bamstorm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

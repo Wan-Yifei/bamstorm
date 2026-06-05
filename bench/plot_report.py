@@ -23,19 +23,19 @@ except Exception as _e:
 
 # ── colour palette (colour-blind friendly) ────────────────────────────────────
 PALETTE = {
-    "bamstrom":                   "#E05C2A",   # orange-red  (hero)
+    "bamstorm":                   "#E05C2A",   # orange-red  (hero)
     "samtools view -c":           "#4C72B0",   # steel blue
     "rabbitbam benchmark_count":  "#55A868",   # green
     "pysam fetch(until_eof)":     "#8172B2",   # purple
 }
 MARKER = {
-    "bamstrom":                   "o",
+    "bamstorm":                   "o",
     "samtools view -c":           "s",
     "rabbitbam benchmark_count":  "^",
     "pysam fetch(until_eof)":     "D",
 }
 DISPLAY = {
-    "bamstrom":                   "bamstrom",
+    "bamstorm":                   "bamstorm",
     "samtools view -c":           "samtools view -c",
     "rabbitbam benchmark_count":  "rabbitbam",
     "pysam fetch(until_eof)":     "pysam",
@@ -163,7 +163,7 @@ def plot_peak_bar(ax, data: dict) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot bamstrom benchmark report")
+    parser = argparse.ArgumentParser(description="Plot bamstorm benchmark report")
     parser.add_argument("csv", help="Path to benchmark CSV")
     parser.add_argument(
         "--out", default=None,

@@ -7,7 +7,7 @@
 /// Example:
 ///   cargo run --example deidentify -- \
 ///       patient.bam patient.bam.bai anon.bam "PATIENT-001" "SUBJECT"
-use bamstrom::{
+use bamstorm::{
     bai_parser::{get_linear_indexes, get_linear_intervals},
     get_bam_header, process_records_through_intervals, update_bam_record,
 };

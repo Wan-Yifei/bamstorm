@@ -1,4 +1,4 @@
-# Benchmark configuration for bamstrom vs samtools vs rabbitbam vs pysam.
+# Benchmark configuration for bamstorm vs samtools vs rabbitbam vs pysam.
 # Edit this file to control which thread counts are tested.
 # 0 is a special value meaning "use all available CPU cores".
 
@@ -12,7 +12,7 @@ repeats = 3
 drop_cache = true
 
 # Per-tool overrides — uncomment to diverge from benchmark.threads.
-# [bamstrom]
+# [bamstorm]
 # threads = [1, 2, 4, 8, 0]
 
 # [samtools]

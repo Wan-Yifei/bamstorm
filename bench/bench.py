@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BAM reader benchmark: bamstrom vs samtools vs rabbitbam vs pysam.
+BAM reader benchmark: bamstorm vs samtools vs rabbitbam vs pysam.
 
 Metrics per run:
   - Wall-clock elapsed time (seconds)
@@ -88,7 +88,7 @@ def fmt_row(r: dict, bam_mb: float) -> str:
 
 # ── runners ───────────────────────────────────────────────────────────────────
 
-def run_bamstrom(bam: str, bai: str, threads: int) -> tuple[float, int]:
+def run_bamstorm(bam: str, bai: str, threads: int) -> tuple[float, int]:
     cmd = [BENCH_COUNT_BIN, "--threads", str(threads), bam, bai]
     t0 = time.perf_counter()
     try:
@@ -168,7 +168,7 @@ def main() -> None:
     max_cpus = os.cpu_count() or 1
 
     default_threads = cfg.get("benchmark", {}).get("threads", [1, 2, 4, 8, 0])
-    bamstrom_threads  = tool_threads(cfg, "bamstrom",  default_threads, max_cpus)
+    bamstorm_threads  = tool_threads(cfg, "bamstorm",  default_threads, max_cpus)
     samtools_threads  = tool_threads(cfg, "samtools",  default_threads, max_cpus)
     rabbitbam_threads = tool_threads(cfg, "rabbitbam", default_threads, max_cpus)
     pysam_threads     = tool_threads(cfg, "pysam",     default_threads, max_cpus)
@@ -184,7 +184,7 @@ def main() -> None:
     print(f"BAM file : {args.bam}  ({bam_mb:.1f} MB)")
     print(f"CPU cores: {max_cpus}")
     print(f"Repeats  : {repeats}  (best of N reported)")
-    print(f"threads  : {default_threads} (bamstrom={bamstrom_threads} samtools={samtools_threads} "
+    print(f"threads  : {default_threads} (bamstorm={bamstorm_threads} samtools={samtools_threads} "
           f"rabbitbam={rabbitbam_threads} pysam={pysam_threads})")
     print()
     print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
@@ -210,14 +210,14 @@ def main() -> None:
     def record_err(tool: str, threads: int, error: str) -> dict:
         return {"tool": tool, "threads": threads, "error": error}
 
-    # bamstrom
-    print("  [bamstrom]")
-    for t in bamstrom_threads:
+    # bamstorm
+    print("  [bamstorm]")
+    for t in bamstorm_threads:
         try:
-            elapsed, count = timed_best(run_bamstrom, args.bam, args.bai, t)
-            r = record_ok("bamstrom", t, elapsed, count)
+            elapsed, count = timed_best(run_bamstorm, args.bam, args.bai, t)
+            r = record_ok("bamstorm", t, elapsed, count)
         except Exception as e:
-            r = record_err("bamstrom", t, str(e))
+            r = record_err("bamstorm", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 

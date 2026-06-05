@@ -1,4 +1,4 @@
-# bamstrom
+# bamstorm
 
 A high-performance parallel BAM reader for large-scale genomics workloads, written in Rust with Python bindings via PyO3.
 
@@ -8,22 +8,22 @@ The BAM format and the toolchain built around it (samtools, htslib, pysam) were 
 
 Modern infrastructure has changed that picture. NVMe SSDs expose multiple IO queues and can sustain hundreds of thousands of IOPS with near-zero seek cost. Servers routinely ship with 32, 64, or 128 cores. Cloud instances are sold by the core-hour, so wall-clock time directly maps to cost. Yet the standard BAM IO path has not fundamentally changed — it still issues a single sequential read stream, leaving most of the available hardware idle.
 
-bamstrom is a ground-up redesign of the BAM read path for this hardware generation. Instead of one sequential stream, it uses the BAI linear index to partition the file into independent byte ranges and reads all of them concurrently — saturating multiple IO queues and all available cores simultaneously. The result is a tool that treats a 48 GB BAM file the way modern hardware expects: as a parallel IO problem, not a serial one.
+bamstorm is a ground-up redesign of the BAM read path for this hardware generation. Instead of one sequential stream, it uses the BAI linear index to partition the file into independent byte ranges and reads all of them concurrently — saturating multiple IO queues and all available cores simultaneously. The result is a tool that treats a 48 GB BAM file the way modern hardware expects: as a parallel IO problem, not a serial one.
 
 The practical consequence is a direct reduction in analysis cost for industrial-scale bioinformatics pipelines. A workflow that counts or scans hundreds of whole-genome BAM files per day can cut its compute footprint by 2–3× simply by replacing the IO layer, with no changes to downstream logic.
 
 ## How it works
 
-Standard tools (samtools, pysam/htslib) read BAM files with a single IO thread and decompress BGZF blocks in parallel. **bamstrom** takes a different approach: it uses the BAI linear index to split the file into independent byte-range intervals, then reads and decompresses all intervals simultaneously with rayon.
+Standard tools (samtools, pysam/htslib) read BAM files with a single IO thread and decompress BGZF blocks in parallel. **bamstorm** takes a different approach: it uses the BAI linear index to split the file into independent byte-range intervals, then reads and decompresses all intervals simultaneously with rayon.
 
 ```
 htslib:  single fd → sequential read → parallel BGZF decompress
-bamstrom: BAI intervals → N parallel fds → parallel read + decompress
+bamstorm: BAI intervals → N parallel fds → parallel read + decompress
 ```
 
 ## Related tools
 
-Several tools have tackled BAM parallelism before bamstrom, each with a different approach.
+Several tools have tackled BAM parallelism before bamstorm, each with a different approach.
 
 ### QuickBAM
 
@@ -52,16 +52,16 @@ single fd → sequential read → BGZF decompress
 
 The design eliminates lock contention and copy overhead during parsing, which is the dominant cost for short-read BAMs where record count is high. RabbitBAM achieves 2.1–3.3× speedup over samtools/htslib on NGS datasets.
 
-### How bamstrom differs
+### How bamstorm differs
 
-Both QuickBAM and RabbitBAM retain a single sequential IO stream and parallelize the work *after* bytes are read. bamstrom moves the parallelism to the IO layer itself: by splitting the file into independent byte-range intervals (derived from the BAI linear index), it opens N file descriptors and issues N concurrent read+decompress streams simultaneously. On NVMe storage this saturates multiple IO queues, something a single-stream design cannot do regardless of how many decompression threads it spawns.
+Both QuickBAM and RabbitBAM retain a single sequential IO stream and parallelize the work *after* bytes are read. bamstorm moves the parallelism to the IO layer itself: by splitting the file into independent byte-range intervals (derived from the BAI linear index), it opens N file descriptors and issues N concurrent read+decompress streams simultaneously. On NVMe storage this saturates multiple IO queues, something a single-stream design cannot do regardless of how many decompression threads it spawns.
 
 ## Installation
 
 **Python (recommended)**
 
 ```bash
-pip install bamstrom
+pip install bamstorm
 ```
 
 Wheels are built against the stable ABI (`abi3`) and work on Python 3.8+.
@@ -69,8 +69,8 @@ Wheels are built against the stable ABI (`abi3`) and work on Python 3.8+.
 **From source (requires Rust)**
 
 ```bash
-git clone https://github.com/Wan-Yifei/bamstrom
-cd bamstrom
+git clone https://github.com/Wan-Yifei/bamstorm
+cd bamstorm
 pip install maturin
 maturin develop --release --features python
 ```
@@ -78,23 +78,23 @@ maturin develop --release --features python
 ## Python usage
 
 ```python
-import bamstrom
+import bamstorm
 
 # Mapped reads only — matches pysam.AlignmentFile.count()
-mapped = bamstrom.count("sample.bam", "sample.bam.bai")
+mapped = bamstorm.count("sample.bam", "sample.bam.bai")
 
 # All reads including unmapped — matches pysam.AlignmentFile.count(until_eof=True)
-total = bamstrom.count("sample.bam", "sample.bam.bai", until_eof=True)
+total = bamstorm.count("sample.bam", "sample.bam.bai", until_eof=True)
 
 print(f"mapped={mapped}  total={total}  unmapped={total - mapped}")
 
 # Same API on AlignmentFile
-with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+with bamstorm.AlignmentFile("sample.bam", "sample.bam.bai") as af:
     mapped = af.count()
     total  = af.count(until_eof=True)
 
 # Iterate over records
-with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+with bamstorm.AlignmentFile("sample.bam", "sample.bam.bai") as af:
     for read in af:
         if read.is_unmapped:
             continue
@@ -129,11 +129,11 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-bamstrom = { git = "https://github.com/Wan-Yifei/bamstrom" }
+bamstorm = { git = "https://github.com/Wan-Yifei/bamstorm" }
 ```
 
 ```rust
-use bamstrom::{bai_parser::{get_linear_indexes, get_linear_intervals}, count_all_records};
+use bamstorm::{bai_parser::{get_linear_indexes, get_linear_intervals}, count_all_records};
 
 let indexes = get_linear_indexes("sample.bam.bai")?;
 let intervals = get_linear_intervals(&indexes)?;
@@ -142,37 +142,37 @@ let total = count_all_records("sample.bam", &intervals)?;
 
 ## Working alongside pysam
 
-bamstrom and pysam are complementary. bamstrom accelerates bulk IO; pysam provides flexible record manipulation, random-access region queries, and full tag support.
+bamstorm and pysam are complementary. bamstorm accelerates bulk IO; pysam provides flexible record manipulation, random-access region queries, and full tag support.
 
 ### Drop-in replacement for counting
 
 ```python
 import pysam
-import bamstrom
+import bamstorm
 
 # Mapped reads
 with pysam.AlignmentFile("sample.bam", "rb") as af:
     n = af.count()                                           # pysam
-n = bamstrom.count("sample.bam", "sample.bam.bai")          # bamstrom — parallel equivalent
+n = bamstorm.count("sample.bam", "sample.bam.bai")          # bamstorm — parallel equivalent
 
 # All reads (including unmapped)
 with pysam.AlignmentFile("sample.bam", "rb") as af:
     n = af.count(until_eof=True)                             # pysam
-n = bamstrom.count("sample.bam", "sample.bam.bai",
-                   until_eof=True)                           # bamstrom — parallel equivalent
+n = bamstorm.count("sample.bam", "sample.bam.bai",
+                   until_eof=True)                           # bamstorm — parallel equivalent
 ```
 
-### Pre-filter with bamstrom, then process with pysam
+### Pre-filter with bamstorm, then process with pysam
 
-Use bamstrom to quickly collect read names or flags that pass a criterion, then re-fetch only those reads with pysam for detailed processing.
+Use bamstorm to quickly collect read names or flags that pass a criterion, then re-fetch only those reads with pysam for detailed processing.
 
 ```python
-import bamstrom
+import bamstorm
 import pysam
 
 # Step 1: fast parallel scan — collect names of mapped, non-duplicate reads
 keep = set()
-with bamstrom.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+with bamstorm.AlignmentFile("sample.bam", "sample.bam.bai") as af:
     for read in af:
         if not read.is_unmapped and not read.is_duplicate:
             keep.add(read.query_name)
@@ -191,18 +191,18 @@ with pysam.AlignmentFile("sample.bam", "rb") as af:
 
 | Task | Recommended |
 |------|-------------|
-| Count mapped reads | `bamstrom.count()` |
-| Count all reads (incl. unmapped) | `bamstrom.count(until_eof=True)` |
-| Bulk flag filtering | `bamstrom.AlignmentFile` |
-| Simple field access (name, flag, pos, CIGAR, seq) | `bamstrom.AlignmentFile` |
+| Count mapped reads | `bamstorm.count()` |
+| Count all reads (incl. unmapped) | `bamstorm.count(until_eof=True)` |
+| Bulk flag filtering | `bamstorm.AlignmentFile` |
+| Simple field access (name, flag, pos, CIGAR, seq) | `bamstorm.AlignmentFile` |
 | Random-access fetch by genomic region | pysam |
 | Full tag access (`get_tag`, `get_tags`) | pysam |
-| Writing / modifying BAM files | bamstrom Rust API or pysam |
+| Writing / modifying BAM files | bamstorm Rust API or pysam |
 | Complex per-read logic using pysam's full API | pysam |
 
 ### Note on object compatibility
 
-`bamstrom.BamRecord` and `pysam.AlignedSegment` are separate types — you cannot pass a `BamRecord` directly to pysam APIs. For operations that require pysam's full `AlignedSegment` interface, use pysam directly. A `.to_pysam()` conversion method is planned for a future release.
+`bamstorm.BamRecord` and `pysam.AlignedSegment` are separate types — you cannot pass a `BamRecord` directly to pysam APIs. For operations that require pysam's full `AlignedSegment` interface, use pysam directly. A `.to_pysam()` conversion method is planned for a future release.
 
 ## Benchmark
 
@@ -214,7 +214,7 @@ Tested on a 47.8 GB coordinate-sorted BAM (899,477,438 records). Best-of-3 runs,
 
 **Throughput (MB/s) — higher is better**
 
-| Threads | bamstrom | samtools | rabbitbam | pysam |
+| Threads | bamstorm | samtools | rabbitbam | pysam |
 |--------:|---------:|---------:|----------:|------:|
 | 1       | 197      | 193      | 211       | 142   |
 | 2       | 392      | 389      | 418       | 197   |
@@ -224,8 +224,8 @@ Tested on a 47.8 GB coordinate-sorted BAM (899,477,438 records). Best-of-3 runs,
 
 Key observations:
 
-- bamstrom peaks at **~997 MB/s**, roughly **2× faster** than samtools and rabbitbam (~502 MB/s) and **3.4× faster** than pysam (~291 MB/s).
-- bamstrom scales linearly up to 8 threads (~5× over single-thread), then plateaus — the workload becomes IO-bound at that point.
+- bamstorm peaks at **~997 MB/s**, roughly **2× faster** than samtools and rabbitbam (~502 MB/s) and **3.4× faster** than pysam (~291 MB/s).
+- bamstorm scales linearly up to 8 threads (~5× over single-thread), then plateaus — the workload becomes IO-bound at that point.
 - samtools and rabbitbam plateau at 4 threads (~500 MB/s); neither benefits further from more cores.
 - rabbitbam degrades at 128 threads (384 MB/s) due to over-subscription overhead.
 - pysam is CPU-limited at all thread counts, topping out at ~291 MB/s.

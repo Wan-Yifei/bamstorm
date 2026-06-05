@@ -12,22 +12,22 @@ resolution-markers = [
 name = "bamstorm"
 version = "0.1.0"
 source = { editable = "." }
-dependencies = [
-    { name = "matplotlib", version = "3.7.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
-    { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
-    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-]
 
 [package.dev-dependencies]
 dev = [
+    { name = "matplotlib", version = "3.7.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
+    { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "maturin" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "matplotlib", specifier = ">=3.7.5" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "maturin", specifier = ">=1.13.3" }]
+dev = [
+    { name = "matplotlib", specifier = ">=3.7.5" },
+    { name = "maturin", specifier = ">=1.13.3" },
+]
 
 [[package]]
 name = "contourpy"

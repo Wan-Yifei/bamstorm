@@ -210,25 +210,27 @@ Tested on a 47.8 GB coordinate-sorted BAM (899,477,438 records). Best-of-3 runs,
 
 ### v0.3.0 results
 
-![Benchmark v0.3.0](report_v0.3.0.png)
+![Benchmark v0.3.0](docs/report_v0.3.0.png)
 
 **Throughput (MB/s) — higher is better**
 
 | Threads | bamstorm | samtools | rabbitbam | pysam |
 |--------:|---------:|---------:|----------:|------:|
-| 1       | 197      | 193      | 211       | 142   |
-| 2       | 392      | 389      | 418       | 197   |
-| 4       | 775      | 496      | 503       | 291   |
-| 8       | **988**  | 496      | 503       | 290   |
-| 128     | **997**  | 502      | 385       | 288   |
+| 2       | 392      | 388      | 419       | 197   |
+| 4       | 776      | 494      | 503       | 290   |
+| 8       | 968      | 494      | 502       | 298   |
+| 16      | 944      | 498      | 503       | 295   |
+| 32      | 963      | 502      | 502       | 297   |
+| 64      | 967      | 503      | 502       | 300   |
+| 128     | **973**  | 504      | 382       | 292   |
 
 Key observations:
 
-- bamstorm peaks at **~997 MB/s**, roughly **2× faster** than samtools and rabbitbam (~502 MB/s) and **3.4× faster** than pysam (~291 MB/s).
-- bamstorm scales linearly up to 8 threads (~5× over single-thread), then plateaus — the workload becomes IO-bound at that point.
+- bamstorm peaks at **~973 MB/s**, roughly **1.9× faster** than samtools and rabbitbam (~503 MB/s) and **3.2× faster** than pysam (~300 MB/s).
+- bamstorm scales well up to 8 threads, then plateaus around 960–973 MB/s — the workload becomes IO-bound at that point.
 - samtools and rabbitbam plateau at 4 threads (~500 MB/s); neither benefits further from more cores.
-- rabbitbam degrades at 128 threads (384 MB/s) due to over-subscription overhead.
-- pysam is CPU-limited at all thread counts, topping out at ~291 MB/s.
+- rabbitbam degrades at 128 threads (382 MB/s) due to over-subscription overhead.
+- pysam is CPU-limited at all thread counts, topping out at ~300 MB/s.
 
 ### Running the benchmark
 

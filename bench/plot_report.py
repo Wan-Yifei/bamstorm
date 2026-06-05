@@ -110,10 +110,12 @@ def plot_elapsed(ax, data: dict) -> None:
 
 
 def plot_speedup(ax, data: dict) -> None:
+    all_threads = sorted({t for rows in data.values() for t in rows})
+    base_threads = all_threads[0]
     for tool, rows in data.items():
-        if 1 not in rows:
+        if base_threads not in rows:
             continue
-        base = rows[1]["elapsed_s"]
+        base = rows[base_threads]["elapsed_s"]
         xs = sorted(rows)
         ys = [base / rows[t]["elapsed_s"] for t in xs]
         color  = PALETTE.get(tool, "#888888")
@@ -122,7 +124,6 @@ def plot_speedup(ax, data: dict) -> None:
         ax.plot(xs, ys, color=color, marker=marker, linewidth=2,
                 markersize=7, label=label, zorder=3)
     # ideal line
-    all_threads = sorted({t for rows in data.values() for t in rows})
     ideal_x = [all_threads[0], all_threads[-1]]
     ideal_y = [1.0, all_threads[-1] / all_threads[0]]
     ax.plot(ideal_x, ideal_y, "--", color="#aaaaaa", linewidth=1,
@@ -132,7 +133,8 @@ def plot_speedup(ax, data: dict) -> None:
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.set_xticks(all_threads)
-    _style(ax, "Speedup vs Single Thread  (log/log)",
+    base_label = f"{base_threads}-Thread" if base_threads > 1 else "Single Thread"
+    _style(ax, f"Speedup vs {base_label}  (log/log)",
            "Threads (log₂)", "Speedup  (×)")
 
 

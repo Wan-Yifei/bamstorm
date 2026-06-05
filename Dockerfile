@@ -4,6 +4,7 @@ FROM rust:slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libhts-dev \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -64,6 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     samtools \
     python3 \
     python3-pysam \
+    fio \
     zlib1g \
     libbz2-1.0 \
     liblzma5 \
@@ -93,6 +95,6 @@ COPY bench/bench.toml /app/bench.toml
 
 # Test data is mounted at runtime; nothing to COPY here.
 # Usage:
-#   docker run --rm -v /path/to/data:/data bamstrom-bench \
+#   docker run --rm -v /path/to/data:/data bamstorm-bench \
 #       python3 /app/bench.py /data/sample.bam /data/sample.bam.bai
 CMD ["python3", "/app/bench.py", "--help"]

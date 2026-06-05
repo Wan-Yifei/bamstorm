@@ -11,6 +11,18 @@ repeats = 3
 # Requires root on Linux; silently skipped otherwise.
 drop_cache = true
 
+[fio]
+# Set to false to skip disk bandwidth measurement entirely.
+enabled = true
+# Size of the temporary test file fio creates (e.g. "1g", "4g").
+size = "1g"
+# How long each fio run lasts (seconds).
+runtime = 20
+# Number of parallel jobs for the parallel-read test. 0 = all CPU cores.
+numjobs_parallel = 0
+# Directory for the fio temp file. Defaults to the BAM file's directory.
+# tmpdir = "/tmp"
+
 # Per-tool overrides — uncomment to diverge from benchmark.threads.
 # [bamstorm]
 # threads = [1, 2, 4, 8, 0]

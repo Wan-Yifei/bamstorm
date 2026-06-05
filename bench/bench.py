@@ -13,7 +13,9 @@ CLI flags override config values for one-off runs.
 
 import argparse
 import csv
+import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -84,6 +86,42 @@ def fmt_row(r: dict, bam_mb: float) -> str:
         f"  {r['tool']:<28}  threads={str(r['threads']):<4}  "
         f"{r['elapsed']:7.3f}s  {throughput:8.1f} MB/s  records={r['records']}"
     )
+
+
+# ── fio helpers ───────────────────────────────────────────────────────────────
+
+def detect_fs(path: str) -> str:
+    try:
+        out = subprocess.run(
+            ["df", "--output=fstype,target", path],
+            capture_output=True, text=True, check=True,
+        )
+        parts = out.stdout.strip().splitlines()
+        if len(parts) >= 2:
+            fstype, mount = parts[1].split(None, 1)
+            return f"{fstype} on {mount}"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def run_fio(tmpfile: str, numjobs: int, size: str, runtime: int):
+    """Return aggregate sequential read bandwidth in MB/s, or None on failure."""
+    cmd = [
+        "fio", "--name=bamstorm-io",
+        "--rw=read", "--bs=1M",
+        f"--size={size}", f"--numjobs={numjobs}",
+        f"--runtime={runtime}", "--time_based",
+        "--direct=1", "--group_reporting",
+        f"--filename={tmpfile}",
+        "--output-format=json",
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        bw_kb = json.loads(out.stdout)["jobs"][0]["read"]["bw"]
+        return bw_kb / 1024
+    except Exception:
+        return None
 
 
 # ── runners ───────────────────────────────────────────────────────────────────
@@ -191,6 +229,45 @@ def main() -> None:
     print("  " + "-" * 75)
 
     results: list[dict] = []
+
+    # ── fio disk bandwidth ────────────────────────────────────────────────────
+    fio_cfg     = cfg.get("fio", {})
+    fio_enabled = fio_cfg.get("enabled", True)
+
+    if fio_enabled:
+        fio_size    = fio_cfg.get("size",             "1g")
+        fio_runtime = fio_cfg.get("runtime",          20)
+        fio_par_n   = fio_cfg.get("numjobs_parallel", 0)
+        fio_par_n   = max_cpus if fio_par_n == 0 else fio_par_n
+        bam_dir     = os.path.dirname(os.path.abspath(args.bam))
+        fio_dir     = fio_cfg.get("tmpdir", bam_dir)
+
+        print("  [fio disk bandwidth]")
+        if shutil.which("fio"):
+            print(f"  filesystem : {detect_fs(args.bam)}")
+            tmpfile = os.path.join(fio_dir, ".bamstorm_fio.tmp")
+            seq_bw = par_bw = None
+            try:
+                seq_bw = run_fio(tmpfile, 1,         fio_size, fio_runtime)
+                par_bw = run_fio(tmpfile, fio_par_n, fio_size, fio_runtime)
+            finally:
+                try:
+                    os.unlink(tmpfile)
+                except OSError:
+                    pass
+            if seq_bw is not None:
+                print(f"  sequential (1 job)          : {seq_bw:8.1f} MB/s")
+                results.append({"tool": "fio-seq", "threads": 1,
+                                 "elapsed": fio_runtime, "throughput": seq_bw, "records": ""})
+            if par_bw is not None:
+                print(f"  parallel   ({fio_par_n} jobs) : {par_bw:8.1f} MB/s")
+                results.append({"tool": "fio-par", "threads": fio_par_n,
+                                 "elapsed": fio_runtime, "throughput": par_bw, "records": ""})
+            if seq_bw is None and par_bw is None:
+                print("  fio failed — check permissions or available disk space")
+        else:
+            print("  fio not installed — skipped")
+        print()
 
     def timed_best(fn, *fn_args) -> tuple[float, int]:
         best, count = float("inf"), 0

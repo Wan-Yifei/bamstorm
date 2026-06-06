@@ -60,7 +60,7 @@ DX_ARGS=()
 if [[ -n "$DX_PROJECT" ]]; then
     DX_ARGS+=(--destination "${DX_PROJECT}:${DX_DEST}")
 fi
-dx build "$SCRIPT_DIR" "${DX_ARGS[@]+"${DX_ARGS[@]}"}"
+dx build -f "$SCRIPT_DIR" "${DX_ARGS[@]+"${DX_ARGS[@]}"}"
 
 echo ""
 echo "Build complete."

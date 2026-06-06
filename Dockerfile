@@ -47,15 +47,15 @@ RUN git clone --depth 1 --branch 1.21 https://github.com/samtools/htslib.git /op
     && make -j$(nproc) \
     && make install
 
-# RabbitBAM
-RUN git clone https://github.com/RabbitBio/RabbitBAM.git /opt/RabbitBAM
+# RabbitBAM — patch config.h to fix narrowing conversion error under GCC 12
+RUN git clone https://github.com/RabbitBio/RabbitBAM.git /opt/RabbitBAM \
+    && sed -i 's/{-1, 0, -1, 1, 2, -1, -1, 3}/{(int8)-1, 0, (int8)-1, 1, 2, (int8)-1, (int8)-1, 3}/' /opt/RabbitBAM/config.h
 
 WORKDIR /opt/RabbitBAM
 SHELL ["/bin/bash", "-c"]
 
 RUN bash configure.sh /usr/local /usr/local \
     && source env.sh \
-    && sed -i 's/g++ -g /g++ -g -Wno-narrowing /' Makefile \
     && make clean \
     && make -j$(nproc)
 

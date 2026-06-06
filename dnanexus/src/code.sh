@@ -85,7 +85,7 @@ TOML
 
     # ── run benchmark ─────────────────────────────────────────────────────────
     echo "Starting benchmark..."
-    docker run --rm \
+    docker run --rm --privileged \
         -v /mnt/work/data:/data \
         -v /mnt/work/results:/results \
         -v /mnt/work/bench.toml:/app/bench.toml:ro \
@@ -105,5 +105,3 @@ TOML
     dx-upload-all-outputs --parallel
     echo "Done."
 }
-
-main "$@"

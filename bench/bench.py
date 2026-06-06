@@ -174,8 +174,9 @@ def drop_caches() -> None:
     try:
         with open("/proc/sys/vm/drop_caches", "w") as fh:
             fh.write("1\n")
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[error] drop_caches failed: {e} — aborting benchmark", flush=True)
+        sys.exit(0)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -269,20 +270,20 @@ def main() -> None:
             print("  fio not installed — skipped")
         print()
 
-    def timed_best(fn, *fn_args) -> tuple[float, int]:
-        best, count = float("inf"), 0
+    def run_repeats(fn, *fn_args) -> list[tuple[float, int]]:
+        runs = []
         for _ in range(repeats):
             if drop_cache:
                 drop_caches()
-            elapsed, count = fn(*fn_args)
-            if elapsed < best:
-                best = elapsed
-        return best, count
+            runs.append(fn(*fn_args))
+        return runs
 
-    def record_ok(tool: str, threads: int, elapsed: float, count: int) -> dict:
+    def record_ok(tool: str, threads: int, runs: list[tuple[float, int]]) -> dict:
+        elapsed, count = min(runs, key=lambda x: x[0])
         return {"tool": tool, "threads": threads, "elapsed": elapsed,
                 "throughput": bam_mb / elapsed if elapsed > 0 else float("inf"),
-                "records": count}
+                "records": count,
+                "all_elapsed": [e for e, _ in runs]}
 
     def record_err(tool: str, threads: int, error: str) -> dict:
         return {"tool": tool, "threads": threads, "error": error}
@@ -291,8 +292,8 @@ def main() -> None:
     print("  [bamstorm]")
     for t in bamstorm_threads:
         try:
-            elapsed, count = timed_best(run_bamstorm, args.bam, args.bai, t)
-            r = record_ok("bamstorm", t, elapsed, count)
+            runs = run_repeats(run_bamstorm, args.bam, args.bai, t)
+            r = record_ok("bamstorm", t, runs)
         except Exception as e:
             r = record_err("bamstorm", t, str(e))
         print(fmt_row(r, bam_mb))
@@ -303,8 +304,8 @@ def main() -> None:
     print("  [samtools]")
     for t in samtools_threads:
         try:
-            elapsed, count = timed_best(run_samtools, args.bam, t)
-            r = record_ok("samtools view -c", t, elapsed, count)
+            runs = run_repeats(run_samtools, args.bam, t)
+            r = record_ok("samtools view -c", t, runs)
         except Exception as e:
             r = record_err("samtools view -c", t, str(e))
         print(fmt_row(r, bam_mb))
@@ -315,8 +316,8 @@ def main() -> None:
     print("  [rabbitbam]")
     for t in rabbitbam_threads:
         try:
-            elapsed, count = timed_best(run_rabbitbam, args.bam, t)
-            r = record_ok("rabbitbam benchmark_count", t, elapsed, count)
+            runs = run_repeats(run_rabbitbam, args.bam, t)
+            r = record_ok("rabbitbam benchmark_count", t, runs)
         except Exception as e:
             r = record_err("rabbitbam benchmark_count", t, str(e))
         print(fmt_row(r, bam_mb))
@@ -328,8 +329,8 @@ def main() -> None:
     if HAS_PYSAM:
         for t in pysam_threads:
             try:
-                elapsed, count = timed_best(run_pysam, args.bam, t)
-                r = record_ok("pysam fetch(until_eof)", t, elapsed, count)
+                runs = run_repeats(run_pysam, args.bam, t)
+                r = record_ok("pysam fetch(until_eof)", t, runs)
             except Exception as e:
                 r = record_err("pysam fetch(until_eof)", t, str(e))
             print(fmt_row(r, bam_mb))
@@ -345,19 +346,34 @@ def main() -> None:
         try:
             writer = csv.DictWriter(
                 fh,
-                fieldnames=["tool", "threads", "elapsed_s", "throughput_mb_s", "records", "error"],
+                fieldnames=["tool", "threads", "repeat", "elapsed_s", "throughput_mb_s", "records", "error"],
                 extrasaction="ignore",
             )
             writer.writeheader()
             for r in results:
-                writer.writerow({
-                    "tool":             r["tool"],
-                    "threads":          r["threads"],
-                    "elapsed_s":        r.get("elapsed", ""),
-                    "throughput_mb_s":  f"{r['throughput']:.1f}" if "throughput" in r else "",
-                    "records":          r.get("records", ""),
-                    "error":            r.get("error", ""),
-                })
+                if "error" in r:
+                    writer.writerow({
+                        "tool": r["tool"], "threads": r["threads"], "repeat": "",
+                        "elapsed_s": "", "throughput_mb_s": "", "records": "",
+                        "error": r["error"],
+                    })
+                elif "all_elapsed" in r:
+                    for i, elapsed in enumerate(r["all_elapsed"], 1):
+                        writer.writerow({
+                            "tool": r["tool"], "threads": r["threads"], "repeat": i,
+                            "elapsed_s": elapsed,
+                            "throughput_mb_s": f"{bam_mb / elapsed:.1f}" if elapsed > 0 else "",
+                            "records": r["records"],
+                            "error": "",
+                        })
+                else:
+                    writer.writerow({
+                        "tool": r["tool"], "threads": r["threads"], "repeat": "",
+                        "elapsed_s": r.get("elapsed", ""),
+                        "throughput_mb_s": f"{r['throughput']:.1f}" if "throughput" in r else "",
+                        "records": r.get("records", ""),
+                        "error": "",
+                    })
         finally:
             if fh is not sys.stdout:
                 fh.close()

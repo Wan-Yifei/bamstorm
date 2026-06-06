@@ -17,42 +17,19 @@ main() {
     echo "Repeats : $repeats"
     echo ""
 
-    # ── mount local NVMe scratch disk ────────────────────────────────────────
+    # ── scratch directory (DNAnexus mounts NVMe RAID at /) ───────────────────
     echo "=== Storage layout ==="
     lsblk -d -o NAME,ROTA,TYPE,SIZE,MOUNTPOINT
+    df -h /
     echo ""
+    mkdir -p /mnt/work
 
-    if ! mountpoint -q /mnt/work 2>/dev/null; then
-        # Scan /dev/nvme*n1 directly — lsblk may enumerate devices whose
-        # device nodes haven't been created yet, causing mkfs to fail.
-        SCRATCH_DEV=""
-        SCRATCH_SIZE=0
-        for dev in /dev/nvme*n1; do
-            [[ -b "$dev" ]] || continue                        # must be a block device
-            grep -q "^$dev " /proc/mounts && continue          # skip if already mounted
-            size=$(blockdev --getsize64 "$dev")
-            if [[ $size -gt 107374182400 && $size -gt $SCRATCH_SIZE ]]; then
-                SCRATCH_DEV="$dev"
-                SCRATCH_SIZE=$size
-            fi
-        done
-
-        if [[ -n "$SCRATCH_DEV" ]]; then
-            echo "Formatting $SCRATCH_DEV ($(( SCRATCH_SIZE / 1073741824 )) GB) as ext4..."
-            mkfs.ext4 -F "$SCRATCH_DEV"
-            mkdir -p /mnt/work
-            mount "$SCRATCH_DEV" /mnt/work
-            echo "Mounted $SCRATCH_DEV at /mnt/work"
-        else
-            echo "No spare NVMe found — using root filesystem for scratch"
-            mkdir -p /mnt/work
-        fi
+    # ── ensure fio is available on the worker ─────────────────────────────────
+    if ! command -v fio &>/dev/null; then
+        apt-get install -y --no-install-recommends fio > /dev/null
     fi
-    df -h /mnt/work
-    echo ""
 
     echo "=== fio pre-flight (sequential read, 10s) ==="
-    mkdir -p /mnt/work
     fio --name=preflight --rw=read --bs=1m --size=512m \
         --filename=/mnt/work/fio_preflight.dat \
         --runtime=10 --time_based --direct=1 \

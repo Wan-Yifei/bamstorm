@@ -135,40 +135,67 @@ def plot_throughput(ax, data: dict, fio: dict) -> None:
 
 def plot_box(ax, data: dict) -> None:
     """
-    Box plot per tool — pools all thread counts × repeats (N = threads × repeats).
-    Individual data points shown as jittered scatter.
+    Grouped box plot: x-axis = thread count, one box per tool per thread.
+    Each box covers the N repeats at that (tool, threads) combination.
+    Individual data points shown as jittered scatter on top.
     """
-    tools  = list(data.keys())
-    labels = [DISPLAY.get(t, t) for t in tools]
-    pool   = [[v for vals in td.values() for v in vals] for td in data.values()]
-    colors = [PALETTE.get(t, "#888888") for t in tools]
+    tools      = list(data.keys())
+    all_threads = _thread_ticks(data)
+    n_tools    = len(tools)
+    group_w    = 0.75
+    box_w      = group_w / n_tools * 0.88
+    offsets    = [(i - (n_tools - 1) / 2) * group_w / n_tools
+                  for i in range(n_tools)]
 
-    bp = ax.boxplot(
-        pool, patch_artist=True, notch=False,
-        medianprops=dict(color="white", linewidth=2.2),
-        whiskerprops=dict(linewidth=1.2),
-        capprops=dict(linewidth=1.2),
-        flierprops=dict(marker="x", markersize=4, alpha=0.4),
-        zorder=3,
-    )
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.6)
-
+    from matplotlib.patches import Patch
     random.seed(42)
-    for i, (vals, color) in enumerate(zip(pool, colors), 1):
-        xs = [i + random.uniform(-0.2, 0.2) for _ in vals]
-        ax.scatter(xs, vals, color=color, s=22, alpha=0.75, zorder=5,
-                   edgecolors="none")
+    for j, tool in enumerate(tools):
+        td     = data[tool]
+        color  = PALETTE.get(tool, "#888888")
+        positions = []
+        box_data  = []
+        for i, t in enumerate(all_threads):
+            if t not in td:
+                continue
+            positions.append(i + offsets[j])
+            box_data.append(td[t])
 
-    ax.set_xticks(range(1, len(tools) + 1))
-    ax.set_xticklabels(labels, fontsize=8, rotation=12, ha="right")
+        bp = ax.boxplot(
+            box_data,
+            positions=positions,
+            widths=box_w,
+            patch_artist=True,
+            notch=False,
+            medianprops=dict(color="white", linewidth=1.8),
+            whiskerprops=dict(linewidth=1.0, color=color),
+            capprops=dict(linewidth=1.0, color=color),
+            flierprops=dict(marker="", markersize=0),
+            manage_ticks=False,
+            zorder=3,
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor(color)
+            patch.set_alpha(0.60)
+
+        for pos, vals in zip(positions, box_data):
+            jitter = [pos + random.uniform(-box_w * 0.28, box_w * 0.28)
+                      for _ in vals]
+            ax.scatter(jitter, vals, color=color, s=20, alpha=0.85,
+                       zorder=5, edgecolors="none")
+
+    ax.set_xticks(range(len(all_threads)))
+    ax.set_xticklabels([str(t) for t in all_threads], fontsize=9)
+    ax.set_xlabel("Threads", fontsize=9)
     ax.set_ylabel("Throughput  (MB/s)", fontsize=9)
-    ax.set_title("Distribution  (all threads × repeats pooled)",
+    ax.set_title("Throughput Distribution per Thread Count  (N repeats per box)",
                  fontsize=11, fontweight="bold", pad=8)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.grid(axis="y", color="#e0e0e0", linewidth=0.7, zorder=0)
+
+    handles = [Patch(facecolor=PALETTE.get(t, "#888"), alpha=0.7,
+                     label=DISPLAY.get(t, t)) for t in tools]
+    ax.legend(handles=handles, fontsize=8, framealpha=0.85)
 
 
 def plot_speedup(ax, data: dict) -> None:
@@ -253,18 +280,18 @@ def main() -> None:
     if not data:
         sys.exit(f"No valid rows found in {csv_path}")
 
-    fig = plt.figure(figsize=(14, 10), facecolor="white")
+    fig = plt.figure(figsize=(14, 13), facecolor="white")
     fig.suptitle(
         f"BAM Reader Benchmark — {csv_path.stem}",
-        fontsize=14, fontweight="bold", y=0.98,
+        fontsize=14, fontweight="bold", y=0.99,
     )
-    gs = GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.34,
-                  left=0.08, right=0.97, top=0.92, bottom=0.09)
+    gs = GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.34,
+                  left=0.08, right=0.97, top=0.94, bottom=0.06,
+                  height_ratios=[1, 1.1])
 
     plot_throughput(fig.add_subplot(gs[0, 0]), data, fio)
-    plot_box(fig.add_subplot(gs[0, 1]), data)
-    plot_speedup(fig.add_subplot(gs[1, 0]), data)
-    plot_peak_bar(fig.add_subplot(gs[1, 1]), data)
+    plot_speedup(fig.add_subplot(gs[0, 1]), data)
+    plot_box(fig.add_subplot(gs[1, :]), data)          # full-width bottom
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Report saved: {out_path}")

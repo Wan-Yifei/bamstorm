@@ -1,0 +1,74 @@
+{
+  "name": "bamstorm_bench",
+  "title": "Bamstorm BAM Reader Benchmark",
+  "summary": "Benchmark BAM read throughput: bamstorm vs samtools vs RabbitBAM vs pysam",
+  "version": "0.1.0",
+  "inputSpec": [
+    {
+      "name": "bam_file",
+      "label": "BAM file",
+      "class": "file",
+      "patterns": ["*.bam"],
+      "help": "Input BAM file to benchmark"
+    },
+    {
+      "name": "bai_file",
+      "label": "BAM index",
+      "class": "file",
+      "patterns": ["*.bai"],
+      "help": "Index file for the BAM (.bam.bai)"
+    },
+    {
+      "name": "docker_image",
+      "label": "Docker image",
+      "class": "string",
+      "help": "Full Docker image reference, e.g. docker.io/yourname/bamstorm-bench:latest"
+    },
+    {
+      "name": "threads",
+      "label": "Thread counts",
+      "class": "string",
+      "default": "1,2,4,8,16,32,64,96",
+      "optional": true,
+      "help": "Comma-separated thread counts to benchmark (e.g. '2,4,8,16')"
+    },
+    {
+      "name": "repeats",
+      "label": "Repeats",
+      "class": "int",
+      "default": 3,
+      "optional": true,
+      "help": "Timed repetitions per configuration; fastest run is reported"
+    }
+  ],
+  "outputSpec": [
+    {
+      "name": "results_csv",
+      "label": "Results CSV",
+      "class": "file",
+      "patterns": ["*.csv"],
+      "help": "Benchmark results: tool, threads, elapsed_s, throughput_mb_s, records"
+    },
+    {
+      "name": "bench_log",
+      "label": "Benchmark log",
+      "class": "file",
+      "patterns": ["*.txt"],
+      "help": "Full stdout from the benchmark run"
+    }
+  ],
+  "runSpec": {
+    "interpreter": "bash",
+    "distribution": "Ubuntu",
+    "release": "20.04",
+    "file": "src/code.sh",
+    "systemRequirements": {
+      "*": {
+        "instanceType": "mem1_ssd1_v2_x16"
+      }
+    }
+  },
+  "access": {
+    "network": ["*"]
+  }
+}

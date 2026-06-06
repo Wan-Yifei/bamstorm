@@ -85,6 +85,7 @@ TOML
 
     # ── run benchmark (repeat loop here; drop_cache on host before each run) ──
     echo "Starting benchmark..."
+    failed_repeats=()
     for i in $(seq 1 "$repeats"); do
         echo ""
         echo "=== Repeat ${i}/${repeats}: dropping page cache ==="
@@ -96,7 +97,7 @@ TOML
             append_arg="--append"
         fi
 
-        docker run --rm \
+        if ! docker run --rm \
             -v /mnt/work/data:/data \
             -v /mnt/work/results:/results \
             -v /mnt/work/bench.toml:/app/bench.toml:ro \
@@ -110,8 +111,16 @@ TOML
                 --repeat-index "$i" \
                 --csv /results/benchmark.csv \
                 $append_arg \
-            2>&1 | tee -a /mnt/work/results/bench.log
+            2>&1 | tee -a /mnt/work/results/bench.log; then
+            echo "ERROR: repeat ${i} failed (exit $?)" | tee -a /mnt/work/results/bench.log
+            failed_repeats+=("$i")
+        fi
     done
+
+    if [ ${#failed_repeats[@]} -gt 0 ]; then
+        echo "ERROR: ${#failed_repeats[@]} repeat(s) failed: ${failed_repeats[*]}"
+        exit 1
+    fi
 
     # ── upload outputs ────────────────────────────────────────────────────────
     mkdir -p ~/out/results_csv ~/out/bench_log

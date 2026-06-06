@@ -110,7 +110,7 @@ def _peak_thread(td: dict[int, list[float]]) -> int:
 # ── charts ────────────────────────────────────────────────────────────────────
 
 def plot_throughput(ax, data: dict, fio: dict) -> None:
-    """Mean line + min/max shaded band + fio horizontal reference lines."""
+    """Mean line + min/max shaded band + individual repeat dots + fio reference lines."""
     for tool, td in data.items():
         xs    = sorted(td)
         means = [statistics.mean(td[t]) for t in xs]
@@ -120,6 +120,10 @@ def plot_throughput(ax, data: dict, fio: dict) -> None:
         marker = MARKER.get(tool, "o")
         label  = DISPLAY.get(tool, tool)
         ax.fill_between(xs, lo, hi, color=color, alpha=0.13, zorder=1)
+        # individual repeat dots
+        for x, vals in td.items():
+            ax.scatter([x] * len(vals), vals, color=color, s=18,
+                       alpha=0.45, zorder=2, edgecolors="none")
         ax.plot(xs, means, color=color, marker=marker, linewidth=2,
                 markersize=6, label=label, zorder=3)
         for x, y in zip(xs, means):
@@ -129,7 +133,7 @@ def plot_throughput(ax, data: dict, fio: dict) -> None:
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.set_xticks(_thread_ticks(data))
-    _style(ax, "Throughput vs Thread Count  (mean ± range)",
+    _style(ax, "Throughput vs Thread Count  (mean ± range, dots = repeats)",
            "Threads (log₂)", "Throughput  (MB/s)")
 
 
@@ -280,18 +284,18 @@ def main() -> None:
     if not data:
         sys.exit(f"No valid rows found in {csv_path}")
 
-    fig = plt.figure(figsize=(14, 13), facecolor="white")
+    fig = plt.figure(figsize=(14, 10), facecolor="white")
     fig.suptitle(
         f"BAM Reader Benchmark — {csv_path.stem}",
-        fontsize=14, fontweight="bold", y=0.99,
+        fontsize=14, fontweight="bold", y=0.98,
     )
-    gs = GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.34,
-                  left=0.08, right=0.97, top=0.94, bottom=0.06,
-                  height_ratios=[1, 1.1])
+    gs = GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.34,
+                  left=0.08, right=0.97, top=0.92, bottom=0.09,
+                  height_ratios=[1.2, 1])
 
-    plot_throughput(fig.add_subplot(gs[0, 0]), data, fio)
-    plot_speedup(fig.add_subplot(gs[0, 1]), data)
-    plot_box(fig.add_subplot(gs[1, :]), data)          # full-width bottom
+    plot_throughput(fig.add_subplot(gs[0, :]), data, fio)   # full-width top
+    plot_speedup(fig.add_subplot(gs[1, 0]), data)
+    plot_peak_bar(fig.add_subplot(gs[1, 1]), data)
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Report saved: {out_path}")

@@ -171,13 +171,12 @@ def run_pysam(bam: str, threads: int) -> tuple[float, int]:
 
 
 def drop_caches(bam: str, bai: str) -> None:
+    import shutil
     for path in (bam, bai):
+        tmp = path + ".tmp_nocache"
         try:
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            finally:
-                os.close(fd)
+            shutil.copy2(path, tmp)
+            os.replace(tmp, path)
         except OSError as e:
             print(f"[error] drop_caches failed for {path}: {e} — aborting benchmark", flush=True)
             sys.exit(0)

@@ -26,7 +26,7 @@ main() {
 
     # ── ensure fio is available on the worker ─────────────────────────────────
     if ! command -v fio &>/dev/null; then
-        apt-get install -y --no-install-recommends fio > /dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fio > /dev/null
     fi
 
     echo "=== fio pre-flight (sequential read, 10s) ==="
@@ -43,12 +43,12 @@ print(f'{bw:.0f}')
     rm -f /mnt/work/fio_preflight.dat
     echo "Disk sequential read: ${BANDWIDTH_MB} MB/s"
 
-    if [ "${BANDWIDTH_MB}" -lt 800 ]; then
-        echo "ERROR: disk bandwidth ${BANDWIDTH_MB} MB/s < 800 MB/s threshold"
-        echo "       Likely EBS or network mount, not local NVMe — aborting."
+    if [ "${BANDWIDTH_MB}" -lt 400 ]; then
+        echo "ERROR: disk bandwidth ${BANDWIDTH_MB} MB/s < 400 MB/s threshold"
+        echo "       Likely a slow network mount — aborting."
         exit 1
     fi
-    echo "Storage OK (local NVMe confirmed)"
+    echo "Storage OK (${BANDWIDTH_MB} MB/s — local NVMe RAID with dm-crypt overhead expected)"
     echo ""
 
     # ── download inputs directly to local NVMe ───────────────────────────────

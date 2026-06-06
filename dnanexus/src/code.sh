@@ -17,6 +17,11 @@ main() {
     echo "Repeats : $repeats"
     echo ""
 
+    # ── verify drop_caches is writable (fail fast if not) ────────────────────
+    echo "Testing drop_caches..."
+    echo 1 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+    echo "drop_caches OK"
+
     # ── scratch directory (DNAnexus mounts NVMe RAID at /) ───────────────────
     echo "=== Storage layout ==="
     lsblk -d -o NAME,ROTA,TYPE,SIZE,MOUNTPOINT

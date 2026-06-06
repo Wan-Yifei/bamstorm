@@ -201,6 +201,14 @@ def main() -> None:
         "--csv", metavar="FILE",
         help="Write results to CSV file (use '-' for stdout)",
     )
+    parser.add_argument(
+        "--repeat-index", type=int, default=1, metavar="N",
+        help="Repeat index label written to the CSV repeat column (default: 1)",
+    )
+    parser.add_argument(
+        "--append", action="store_true", default=False,
+        help="Append to existing CSV without writing header",
+    )
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -342,14 +350,16 @@ def main() -> None:
 
     # CSV output
     if args.csv:
-        fh = sys.stdout if args.csv == "-" else open(args.csv, "w", newline="")
+        mode = "a" if args.append else "w"
+        fh = sys.stdout if args.csv == "-" else open(args.csv, mode, newline="")
         try:
             writer = csv.DictWriter(
                 fh,
                 fieldnames=["tool", "threads", "repeat", "elapsed_s", "throughput_mb_s", "records", "error"],
                 extrasaction="ignore",
             )
-            writer.writeheader()
+            if not args.append:
+                writer.writeheader()
             for r in results:
                 if "error" in r:
                     writer.writerow({
@@ -358,7 +368,7 @@ def main() -> None:
                         "error": r["error"],
                     })
                 elif "all_elapsed" in r:
-                    for i, elapsed in enumerate(r["all_elapsed"], 1):
+                    for i, elapsed in enumerate(r["all_elapsed"], args.repeat_index):
                         writer.writerow({
                             "tool": r["tool"], "threads": r["threads"], "repeat": i,
                             "elapsed_s": elapsed,

@@ -17,9 +17,28 @@ main() {
     echo "Repeats : $repeats"
     echo ""
 
-    # ── storage verification ──────────────────────────────────────────────────
+    # ── mount local NVMe scratch disk ────────────────────────────────────────
     echo "=== Storage layout ==="
     lsblk -d -o NAME,ROTA,TYPE,SIZE,MOUNTPOINT
+    echo ""
+
+    if ! mountpoint -q /mnt/work 2>/dev/null; then
+        # Find the largest unmounted disk (>100 GB), excluding loop devices
+        SCRATCH_DEV=$(lsblk -d -b -o NAME,TYPE,SIZE,MOUNTPOINT --noheadings \
+            | awk '$2=="disk" && $4=="" && $3+0 > 107374182400 {print $3, $1}' \
+            | sort -rn | head -1 | awk '{print "/dev/" $2}')
+
+        if [[ -n "$SCRATCH_DEV" ]]; then
+            echo "Formatting $SCRATCH_DEV as ext4 scratch disk..."
+            mkfs.ext4 -F "$SCRATCH_DEV"
+            mkdir -p /mnt/work
+            mount "$SCRATCH_DEV" /mnt/work
+            echo "Mounted $SCRATCH_DEV at /mnt/work"
+        else
+            echo "No spare NVMe found — using root filesystem for scratch"
+            mkdir -p /mnt/work
+        fi
+    fi
     df -h /mnt/work
     echo ""
 

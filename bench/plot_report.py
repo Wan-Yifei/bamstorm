@@ -126,9 +126,12 @@ def plot_throughput(ax, data: dict, fio: dict) -> None:
                        alpha=0.45, zorder=2, edgecolors="none")
         ax.plot(xs, means, color=color, marker=marker, linewidth=2,
                 markersize=6, label=label, zorder=3)
-        for x, y in zip(xs, means):
-            ax.annotate(f"{y:.0f}", (x, y), textcoords="offset points",
-                        xytext=(0, 7), ha="center", fontsize=6, color=color)
+        # annotate only the peak point
+        peak_x = xs[means.index(max(means))]
+        peak_y = max(means)
+        ax.annotate(f"{peak_y:.0f}", (peak_x, peak_y), textcoords="offset points",
+                    xytext=(0, 8), ha="center", fontsize=8,
+                    fontweight="bold", color=color)
     _fio_hlines(ax, fio)
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())

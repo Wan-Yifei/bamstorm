@@ -61,6 +61,7 @@
     "interpreter": "bash",
     "distribution": "Ubuntu",
     "release": "20.04",
+    "version": "0",
     "file": "src/code.sh",
     "systemRequirements": {
       "*": {

@@ -56,7 +56,7 @@ SHELL ["/bin/bash", "-c"]
 RUN bash configure.sh /usr/local /usr/local \
     && source env.sh \
     && make clean \
-    && make -j$(nproc)
+    && make -j$(nproc) CXXFLAGS="-O2 -Wno-narrowing"
 
 # Stage 3: runtime image with samtools + python3-pysam + RabbitBAM
 FROM debian:bookworm-slim AS runtime

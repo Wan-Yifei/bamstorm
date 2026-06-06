@@ -46,13 +46,12 @@ IMAGE="$REGISTRY/bamstorm-bench:$TAG"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== 1/3  Build Docker image ==="
-docker build -t "$IMAGE" "$PROJECT_ROOT"
-echo "Built: $IMAGE"
+echo "=== 1/3  Build Docker image (linux/amd64) ==="
+docker buildx build --platform linux/amd64 -t "$IMAGE" --push "$PROJECT_ROOT"
+echo "Built and pushed: $IMAGE"
 
 echo ""
-echo "=== 2/3  Push to registry ==="
-docker push "$IMAGE"
+echo "=== 2/3  (push included in buildx step above) ==="
 
 echo ""
 echo "=== 3/3  Build DNAnexus applet ==="

@@ -23,13 +23,22 @@ main() {
     echo ""
 
     if ! mountpoint -q /mnt/work 2>/dev/null; then
-        # Find the largest unmounted disk (>100 GB), excluding loop devices
-        SCRATCH_DEV=$(lsblk -d -b -o NAME,TYPE,SIZE,MOUNTPOINT --noheadings \
-            | awk '$2=="disk" && $4=="" && $3+0 > 107374182400 {print $3, $1}' \
-            | sort -rn | head -1 | awk '{print "/dev/" $2}')
+        # Scan /dev/nvme*n1 directly — lsblk may enumerate devices whose
+        # device nodes haven't been created yet, causing mkfs to fail.
+        SCRATCH_DEV=""
+        SCRATCH_SIZE=0
+        for dev in /dev/nvme*n1; do
+            [[ -b "$dev" ]] || continue                        # must be a block device
+            grep -q "^$dev " /proc/mounts && continue          # skip if already mounted
+            size=$(blockdev --getsize64 "$dev")
+            if [[ $size -gt 107374182400 && $size -gt $SCRATCH_SIZE ]]; then
+                SCRATCH_DEV="$dev"
+                SCRATCH_SIZE=$size
+            fi
+        done
 
         if [[ -n "$SCRATCH_DEV" ]]; then
-            echo "Formatting $SCRATCH_DEV as ext4 scratch disk..."
+            echo "Formatting $SCRATCH_DEV ($(( SCRATCH_SIZE / 1073741824 )) GB) as ext4..."
             mkfs.ext4 -F "$SCRATCH_DEV"
             mkdir -p /mnt/work
             mount "$SCRATCH_DEV" /mnt/work

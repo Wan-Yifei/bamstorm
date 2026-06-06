@@ -83,45 +83,19 @@ TOML
     echo "Pulling image..."
     docker pull "$docker_image"
 
-    # ── run benchmark (repeat loop here; drop_cache on host before each run) ──
+    # ── run benchmark ─────────────────────────────────────────────────────────
     echo "Starting benchmark..."
-    failed_repeats=()
-    for i in $(seq 1 "$repeats"); do
-        echo ""
-        echo "=== Repeat ${i}/${repeats}: dropping page cache ==="
-        sync
-        docker run --rm --privileged alpine sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-
-        if [ "$i" -eq 1 ]; then
-            append_arg=""
-        else
-            append_arg="--append"
-        fi
-
-        if ! docker run --rm \
-            -v /mnt/work/data:/data \
-            -v /mnt/work/results:/results \
-            -v /mnt/work/bench.toml:/app/bench.toml:ro \
-            "$docker_image" \
-            python3 /app/bench.py \
-                /data/input.bam \
-                /data/input.bam.bai \
-                --config /app/bench.toml \
-                --no-drop-cache \
-                --repeats 1 \
-                --repeat-index "$i" \
-                --csv /results/benchmark.csv \
-                $append_arg \
-            2>&1 | tee -a /mnt/work/results/bench.log; then
-            echo "ERROR: repeat ${i} failed (exit $?)" | tee -a /mnt/work/results/bench.log
-            failed_repeats+=("$i")
-        fi
-    done
-
-    if [ ${#failed_repeats[@]} -gt 0 ]; then
-        echo "ERROR: ${#failed_repeats[@]} repeat(s) failed: ${failed_repeats[*]}"
-        exit 1
-    fi
+    docker run --rm \
+        -v /mnt/work/data:/data \
+        -v /mnt/work/results:/results \
+        -v /mnt/work/bench.toml:/app/bench.toml:ro \
+        "$docker_image" \
+        python3 /app/bench.py \
+            /data/input.bam \
+            /data/input.bam.bai \
+            --config /app/bench.toml \
+            --csv /results/benchmark.csv \
+        2>&1 | tee /mnt/work/results/bench.log
 
     # ── upload outputs ────────────────────────────────────────────────────────
     mkdir -p ~/out/results_csv ~/out/bench_log

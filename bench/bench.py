@@ -170,13 +170,17 @@ def run_pysam(bam: str, threads: int) -> tuple[float, int]:
     return time.perf_counter() - t0, n
 
 
-def drop_caches() -> None:
-    try:
-        with open("/proc/sys/vm/drop_caches", "w") as fh:
-            fh.write("1\n")
-    except OSError as e:
-        print(f"[error] drop_caches failed: {e} — aborting benchmark", flush=True)
-        sys.exit(0)
+def drop_caches(bam: str, bai: str) -> None:
+    for path in (bam, bai):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            print(f"[error] drop_caches failed for {path}: {e} — aborting benchmark", flush=True)
+            sys.exit(0)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -282,7 +286,7 @@ def main() -> None:
         runs = []
         for _ in range(repeats):
             if drop_cache:
-                drop_caches()
+                drop_caches(args.bam, args.bai)
             runs.append(fn(*fn_args))
         return runs
 

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Generate a visualization report from a benchmark CSV produced by bench.py or bench_history.py.
+Generate a visualization report from a benchmark CSV produced by bench.py.
+Handles multi-repeat CSV (repeat column).
 
 Usage:
-    python bench/plot_report.py benchmark_v0.3.0.csv
-    python bench/plot_report.py benchmark_v0.3.0.csv --out report_v0.3.0.png
+    python bench/plot_report.py benchmark.csv
+    python bench/plot_report.py benchmark.csv --out report.png
 """
 
 import argparse
 import csv
+import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -23,10 +26,10 @@ except Exception as _e:
 
 # ── colour palette (colour-blind friendly) ────────────────────────────────────
 PALETTE = {
-    "bamstorm":                   "#E05C2A",   # orange-red  (hero)
-    "samtools view -c":           "#4C72B0",   # steel blue
-    "rabbitbam benchmark_count":  "#55A868",   # green
-    "pysam fetch(until_eof)":     "#8172B2",   # purple
+    "bamstorm":                   "#E05C2A",
+    "samtools view -c":           "#4C72B0",
+    "rabbitbam benchmark_count":  "#55A868",
+    "pysam fetch(until_eof)":     "#8172B2",
 }
 MARKER = {
     "bamstorm":                   "o",
@@ -40,126 +43,196 @@ DISPLAY = {
     "rabbitbam benchmark_count":  "rabbitbam",
     "pysam fetch(until_eof)":     "pysam",
 }
+FIO_LINES = {
+    "fio-seq": {"color": "#999999", "ls": "--"},
+    "fio-par": {"color": "#555555", "ls": ":"},
+}
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
 
-def load(path: Path) -> dict[str, dict[int, dict]]:
-    """Return {tool: {threads: {elapsed_s, throughput_mb_s}}}."""
-    data: dict[str, dict[int, dict]] = {}
+def load(path: Path):
+    """
+    Returns:
+      data: {tool: {threads: [throughput_mb_s, ...]}}  — list holds all repeats
+      fio:  {"fio-seq": bw, "fio-par": bw}
+    """
+    data: dict[str, dict[int, list[float]]] = {}
+    fio:  dict[str, float] = {}
+
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
             if row.get("error"):
                 continue
             tool = row["tool"]
-            t    = int(row["threads"])
-            data.setdefault(tool, {})[t] = {
-                "elapsed_s":       float(row["elapsed_s"]),
-                "throughput_mb_s": float(row["throughput_mb_s"]),
-            }
-    return data
+            if tool.startswith("fio-"):
+                fio[tool] = float(row["throughput_mb_s"])
+                continue
+            if not row.get("threads") or not row.get("throughput_mb_s"):
+                continue
+            t  = int(row["threads"])
+            bw = float(row["throughput_mb_s"])
+            data.setdefault(tool, {}).setdefault(t, []).append(bw)
+    return data, fio
 
 
-# ── plot helpers ──────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _style(ax, title: str, xlabel: str, ylabel: str) -> None:
-    ax.set_title(title, fontsize=12, fontweight="bold", pad=8)
-    ax.set_xlabel(xlabel, fontsize=10)
-    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=8)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.grid(axis="y", color="#dddddd", linewidth=0.7, zorder=0)
-    ax.grid(axis="x", color="#dddddd", linewidth=0.4, zorder=0)
-    ax.legend(fontsize=9, framealpha=0.8)
+    ax.grid(axis="y", color="#e0e0e0", linewidth=0.7, zorder=0)
+    ax.grid(axis="x", color="#e0e0e0", linewidth=0.4, zorder=0)
+    ax.legend(fontsize=8, framealpha=0.85)
 
 
-def plot_throughput(ax, data: dict) -> None:
-    for tool, rows in data.items():
-        xs = sorted(rows)
-        ys = [rows[t]["throughput_mb_s"] for t in xs]
+def _fio_hlines(ax, fio: dict) -> None:
+    for key in ("fio-seq", "fio-par"):
+        if key not in fio:
+            continue
+        bw    = fio[key]
+        style = FIO_LINES[key]
+        ax.axhline(bw, color=style["color"], linestyle=style["ls"],
+                   linewidth=1.4, label=f"{key}  {bw:.0f} MB/s", zorder=2)
+
+
+def _thread_ticks(data: dict) -> list[int]:
+    return sorted({t for td in data.values() for t in td})
+
+
+def _peak_thread(td: dict[int, list[float]]) -> int:
+    return max(td, key=lambda t: statistics.mean(td[t]))
+
+
+# ── charts ────────────────────────────────────────────────────────────────────
+
+def plot_throughput(ax, data: dict, fio: dict) -> None:
+    """Mean line + min/max shaded band + fio horizontal reference lines."""
+    for tool, td in data.items():
+        xs    = sorted(td)
+        means = [statistics.mean(td[t]) for t in xs]
+        lo    = [min(td[t])             for t in xs]
+        hi    = [max(td[t])             for t in xs]
         color  = PALETTE.get(tool, "#888888")
         marker = MARKER.get(tool, "o")
         label  = DISPLAY.get(tool, tool)
-        ax.plot(xs, ys, color=color, marker=marker, linewidth=2,
-                markersize=7, label=label, zorder=3)
-        for x, y in zip(xs, ys):
+        ax.fill_between(xs, lo, hi, color=color, alpha=0.13, zorder=1)
+        ax.plot(xs, means, color=color, marker=marker, linewidth=2,
+                markersize=6, label=label, zorder=3)
+        for x, y in zip(xs, means):
             ax.annotate(f"{y:.0f}", (x, y), textcoords="offset points",
-                        xytext=(0, 7), ha="center", fontsize=7.5,
-                        color=color)
+                        xytext=(0, 7), ha="center", fontsize=6, color=color)
+    _fio_hlines(ax, fio)
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax.set_xticks(sorted({t for rows in data.values() for t in rows}))
-    _style(ax, "Throughput vs Thread Count",
-           "Threads (log₂ scale)", "Throughput  (MB/s)")
+    ax.set_xticks(_thread_ticks(data))
+    _style(ax, "Throughput vs Thread Count  (mean ± range)",
+           "Threads (log₂)", "Throughput  (MB/s)")
 
 
-def plot_elapsed(ax, data: dict) -> None:
-    for tool, rows in data.items():
-        xs = sorted(rows)
-        ys = [rows[t]["elapsed_s"] for t in xs]
-        color  = PALETTE.get(tool, "#888888")
-        marker = MARKER.get(tool, "o")
-        label  = DISPLAY.get(tool, tool)
-        ax.plot(xs, ys, color=color, marker=marker, linewidth=2,
-                markersize=7, label=label, zorder=3)
-    ax.set_xscale("log", base=2)
-    ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax.set_xticks(sorted({t for rows in data.values() for t in rows}))
-    _style(ax, "Elapsed Time vs Thread Count",
-           "Threads (log₂ scale)", "Elapsed  (s)")
+def plot_box(ax, data: dict) -> None:
+    """
+    Box plot per tool — pools all thread counts × repeats (N = threads × repeats).
+    Individual data points shown as jittered scatter.
+    """
+    tools  = list(data.keys())
+    labels = [DISPLAY.get(t, t) for t in tools]
+    pool   = [[v for vals in td.values() for v in vals] for td in data.values()]
+    colors = [PALETTE.get(t, "#888888") for t in tools]
+
+    bp = ax.boxplot(
+        pool, patch_artist=True, notch=False,
+        medianprops=dict(color="white", linewidth=2.2),
+        whiskerprops=dict(linewidth=1.2),
+        capprops=dict(linewidth=1.2),
+        flierprops=dict(marker="x", markersize=4, alpha=0.4),
+        zorder=3,
+    )
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+
+    random.seed(42)
+    for i, (vals, color) in enumerate(zip(pool, colors), 1):
+        xs = [i + random.uniform(-0.2, 0.2) for _ in vals]
+        ax.scatter(xs, vals, color=color, s=22, alpha=0.75, zorder=5,
+                   edgecolors="none")
+
+    ax.set_xticks(range(1, len(tools) + 1))
+    ax.set_xticklabels(labels, fontsize=8, rotation=12, ha="right")
+    ax.set_ylabel("Throughput  (MB/s)", fontsize=9)
+    ax.set_title("Distribution  (all threads × repeats pooled)",
+                 fontsize=11, fontweight="bold", pad=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", color="#e0e0e0", linewidth=0.7, zorder=0)
 
 
 def plot_speedup(ax, data: dict) -> None:
-    all_threads = sorted({t for rows in data.values() for t in rows})
-    base_threads = all_threads[0]
-    for tool, rows in data.items():
-        if base_threads not in rows:
+    """Speedup relative to single-thread mean, log/log axes."""
+    all_threads = _thread_ticks(data)
+    base = all_threads[0]
+    for tool, td in data.items():
+        if base not in td:
             continue
-        base = rows[base_threads]["elapsed_s"]
-        xs = sorted(rows)
-        ys = [base / rows[t]["elapsed_s"] for t in xs]
+        base_mean = statistics.mean(td[base])
+        xs = sorted(td)
+        ys = [statistics.mean(td[t]) / base_mean for t in xs]
         color  = PALETTE.get(tool, "#888888")
         marker = MARKER.get(tool, "o")
         label  = DISPLAY.get(tool, tool)
         ax.plot(xs, ys, color=color, marker=marker, linewidth=2,
-                markersize=7, label=label, zorder=3)
-    # ideal line
+                markersize=6, label=label, zorder=3)
     ideal_x = [all_threads[0], all_threads[-1]]
     ideal_y = [1.0, all_threads[-1] / all_threads[0]]
-    ax.plot(ideal_x, ideal_y, "--", color="#aaaaaa", linewidth=1,
+    ax.plot(ideal_x, ideal_y, "--", color="#aaaaaa", linewidth=1.2,
             label="ideal", zorder=2)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log", base=2)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.set_xticks(all_threads)
-    base_label = f"{base_threads}-Thread" if base_threads > 1 else "Single Thread"
-    _style(ax, f"Speedup vs {base_label}  (log/log)",
+    _style(ax, "Speedup vs Single Thread  (log/log)",
            "Threads (log₂)", "Speedup  (×)")
 
 
 def plot_peak_bar(ax, data: dict) -> None:
+    """Peak throughput bar (mean at best thread count) with min-max error bars."""
     tools  = list(data.keys())
-    peaks  = [max(v["throughput_mb_s"] for v in rows.values())
-              for rows in data.values()]
-    colors = [PALETTE.get(t, "#888888") for t in tools]
     labels = [DISPLAY.get(t, t) for t in tools]
+    colors = [PALETTE.get(t, "#888888") for t in tools]
 
-    bars = ax.bar(labels, peaks, color=colors, zorder=3, width=0.55,
+    peak_means, err_lo, err_hi = [], [], []
+    for td in data.values():
+        best_t = _peak_thread(td)
+        vals   = td[best_t]
+        m      = statistics.mean(vals)
+        peak_means.append(m)
+        err_lo.append(m - min(vals))
+        err_hi.append(max(vals) - m)
+
+    bars = ax.bar(labels, peak_means, color=colors, zorder=3, width=0.55,
                   edgecolor="white", linewidth=0.8)
-    for bar, val in zip(bars, peaks):
+    ax.errorbar(range(len(labels)), peak_means,
+                yerr=[err_lo, err_hi], fmt="none",
+                ecolor="#333333", elinewidth=1.6, capsize=5, zorder=4)
+    for bar, val in zip(bars, peak_means):
         ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + max(peaks) * 0.015,
+                bar.get_height() + max(peak_means) * 0.02,
                 f"{val:.0f}", ha="center", va="bottom",
                 fontsize=9, fontweight="bold")
-    ax.set_ylabel("Peak Throughput  (MB/s)", fontsize=10)
-    ax.set_title("Peak Throughput per Tool", fontsize=12,
-                 fontweight="bold", pad=8)
+
+    ax.set_ylabel("Peak Throughput  (MB/s)", fontsize=9)
+    ax.set_title("Peak Throughput  (mean ± range at best thread count)",
+                 fontsize=11, fontweight="bold", pad=8)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.grid(axis="y", color="#dddddd", linewidth=0.7, zorder=0)
+    ax.grid(axis="y", color="#e0e0e0", linewidth=0.7, zorder=0)
     ax.tick_params(axis="x", labelsize=9)
-    ax.set_ylim(0, max(peaks) * 1.18)
+    ax.set_ylim(0, max(peak_means) * 1.2)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -167,10 +240,8 @@ def plot_peak_bar(ax, data: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot bamstorm benchmark report")
     parser.add_argument("csv", help="Path to benchmark CSV")
-    parser.add_argument(
-        "--out", default=None,
-        help="Output image path (default: <csv stem>_report.png)",
-    )
+    parser.add_argument("--out", default=None,
+                        help="Output image path (default: <csv stem>_report.png)")
     args = parser.parse_args()
 
     csv_path = Path(args.csv)
@@ -178,21 +249,20 @@ def main() -> None:
         csv_path.stem + "_report.png"
     )
 
-    data = load(csv_path)
+    data, fio = load(csv_path)
     if not data:
         sys.exit(f"No valid rows found in {csv_path}")
 
     fig = plt.figure(figsize=(14, 10), facecolor="white")
     fig.suptitle(
         f"BAM Reader Benchmark — {csv_path.stem}",
-        fontsize=15, fontweight="bold", y=0.98,
+        fontsize=14, fontweight="bold", y=0.98,
     )
+    gs = GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.34,
+                  left=0.08, right=0.97, top=0.92, bottom=0.09)
 
-    gs = GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32,
-                  left=0.08, right=0.97, top=0.92, bottom=0.08)
-
-    plot_throughput(fig.add_subplot(gs[0, 0]), data)
-    plot_elapsed(fig.add_subplot(gs[0, 1]), data)
+    plot_throughput(fig.add_subplot(gs[0, 0]), data, fio)
+    plot_box(fig.add_subplot(gs[0, 1]), data)
     plot_speedup(fig.add_subplot(gs[1, 0]), data)
     plot_peak_bar(fig.add_subplot(gs[1, 1]), data)
 

@@ -89,7 +89,8 @@ TOML
     for i in $(seq 1 "$repeats"); do
         echo ""
         echo "=== Repeat ${i}/${repeats}: dropping page cache ==="
-        sync && echo 3 > /proc/sys/vm/drop_caches
+        sync
+        docker run --rm --privileged alpine sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 
         if [ "$i" -eq 1 ]; then
             append_arg=""

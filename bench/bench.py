@@ -171,14 +171,36 @@ def run_pysam(bam: str, threads: int) -> tuple[float, int]:
 
 
 def drop_caches(bam: str, bai: str) -> None:
-    import shutil
+    import ctypes, ctypes.util
+    POSIX_FADV_DONTNEED = 4
+    try:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    except OSError:
+        _libc = None
+
     for path in (bam, bai):
         tmp = path + ".tmp_nocache"
         try:
             shutil.copy2(path, tmp)
+        except OSError as e:
+            print(f"[error] drop_caches: copy failed for {path}: {e} — aborting benchmark", flush=True)
+            sys.exit(0)
+        # fsync makes dirty write-pages clean so posix_fadvise DONTNEED can evict them.
+        if _libc is not None:
+            try:
+                wfd = os.open(tmp, os.O_RDWR)
+                try:
+                    os.fsync(wfd)
+                    size = os.fstat(wfd).st_size
+                    _libc.posix_fadvise(wfd, 0, size, POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(wfd)
+            except OSError as e:
+                print(f"[warn] drop_caches: fadvise failed for {tmp}: {e}", flush=True)
+        try:
             os.replace(tmp, path)
         except OSError as e:
-            print(f"[error] drop_caches failed for {path}: {e} — aborting benchmark", flush=True)
+            print(f"[error] drop_caches: replace failed for {path}: {e} — aborting benchmark", flush=True)
             sys.exit(0)
 
 

@@ -77,14 +77,15 @@ def file_mb(path: str) -> float:
 
 
 def fmt_row(r: dict, bam_mb: float) -> str:
+    tag = "  [warm]" if r.get("cache") == "warm" else ""
     if "error" in r:
         return (
-            f"  {r['tool']:<28}  threads={str(r['threads']):<4}  ERROR: {r['error']}"
+            f"  {r['tool']:<28}  threads={str(r['threads']):<4}  ERROR: {r['error']}{tag}"
         )
     throughput = bam_mb / r["elapsed"] if r["elapsed"] > 0 else float("inf")
     return (
         f"  {r['tool']:<28}  threads={str(r['threads']):<4}  "
-        f"{r['elapsed']:7.3f}s  {throughput:8.1f} MB/s  records={r['records']}"
+        f"{r['elapsed']:7.3f}s  {throughput:8.1f} MB/s  records={r['records']}{tag}"
     )
 
 
@@ -234,6 +235,10 @@ def main() -> None:
         "--append", action="store_true", default=False,
         help="Append to existing CSV without writing header",
     )
+    parser.add_argument(
+        "--warm-repeats", type=int, default=None, metavar="N",
+        help="Override config: warm-cache repetitions after cold runs (0 = skip)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -245,17 +250,19 @@ def main() -> None:
     rabbitbam_threads = tool_threads(cfg, "rabbitbam", default_threads, max_cpus)
     pysam_threads     = tool_threads(cfg, "pysam",     default_threads, max_cpus)
 
-    repeats    = args.repeats if args.repeats is not None \
-                 else cfg.get("benchmark", {}).get("repeats", 3)
-    drop_cache = (not args.no_drop_cache) if args.no_drop_cache is not None \
-                 else cfg.get("benchmark", {}).get("drop_cache", True)
+    repeats      = args.repeats if args.repeats is not None \
+                   else cfg.get("benchmark", {}).get("repeats", 3)
+    drop_cache   = (not args.no_drop_cache) if args.no_drop_cache is not None \
+                   else cfg.get("benchmark", {}).get("drop_cache", True)
+    warm_repeats = args.warm_repeats if args.warm_repeats is not None \
+                   else cfg.get("benchmark", {}).get("warm_repeats", 0)
 
     bam_mb = file_mb(args.bam)
 
     print(f"\nConfig   : {args.config}")
     print(f"BAM file : {args.bam}  ({bam_mb:.1f} MB)")
     print(f"CPU cores: {max_cpus}")
-    print(f"Repeats  : {repeats}  (best of N reported)")
+    print(f"Repeats  : cold={repeats} (best of N), warm={warm_repeats}")
     print(f"threads  : {default_threads} (bamstorm={bamstorm_threads} samtools={samtools_threads} "
           f"rabbitbam={rabbitbam_threads} pysam={pysam_threads})")
     print()
@@ -311,15 +318,16 @@ def main() -> None:
             runs.append(fn(*fn_args))
         return runs
 
-    def record_ok(tool: str, threads: int, runs: list[tuple[float, int]]) -> dict:
+    def record_ok(tool: str, threads: int, runs: list[tuple[float, int]],
+                  cache: str = "cold") -> dict:
         elapsed, count = min(runs, key=lambda x: x[0])
-        return {"tool": tool, "threads": threads, "elapsed": elapsed,
+        return {"tool": tool, "threads": threads, "cache": cache, "elapsed": elapsed,
                 "throughput": bam_mb / elapsed if elapsed > 0 else float("inf"),
                 "records": count,
                 "all_elapsed": [e for e, _ in runs]}
 
-    def record_err(tool: str, threads: int, error: str) -> dict:
-        return {"tool": tool, "threads": threads, "error": error}
+    def record_err(tool: str, threads: int, error: str, cache: str = "cold") -> dict:
+        return {"tool": tool, "threads": threads, "cache": cache, "error": error}
 
     # bamstorm
     print("  [bamstorm]")
@@ -371,6 +379,56 @@ def main() -> None:
     else:
         print("  pysam not installed — skipped")
 
+    # ── warm-cache runs ────────────────────────────────────────────────────────
+    if warm_repeats > 0:
+        print()
+        print(f"  --- warm cache (no eviction, repeats={warm_repeats}) ---")
+
+        print()
+        print("  [bamstorm]  [warm]")
+        for t in bamstorm_threads:
+            try:
+                runs = [run_bamstorm(args.bam, args.bai, t) for _ in range(warm_repeats)]
+                r = record_ok("bamstorm", t, runs, cache="warm")
+            except Exception as e:
+                r = record_err("bamstorm", t, str(e), cache="warm")
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+
+        print()
+        print("  [samtools]  [warm]")
+        for t in samtools_threads:
+            try:
+                runs = [run_samtools(args.bam, t) for _ in range(warm_repeats)]
+                r = record_ok("samtools view -c", t, runs, cache="warm")
+            except Exception as e:
+                r = record_err("samtools view -c", t, str(e), cache="warm")
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+
+        print()
+        print("  [rabbitbam]  [warm]")
+        for t in rabbitbam_threads:
+            try:
+                runs = [run_rabbitbam(args.bam, t) for _ in range(warm_repeats)]
+                r = record_ok("rabbitbam benchmark_count", t, runs, cache="warm")
+            except Exception as e:
+                r = record_err("rabbitbam benchmark_count", t, str(e), cache="warm")
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+
+        if HAS_PYSAM:
+            print()
+            print("  [pysam]  [warm]")
+            for t in pysam_threads:
+                try:
+                    runs = [run_pysam(args.bam, t) for _ in range(warm_repeats)]
+                    r = record_ok("pysam fetch(until_eof)", t, runs, cache="warm")
+                except Exception as e:
+                    r = record_err("pysam fetch(until_eof)", t, str(e), cache="warm")
+                print(fmt_row(r, bam_mb))
+                results.append(r)
+
     print()
 
     # CSV output
@@ -380,7 +438,7 @@ def main() -> None:
         try:
             writer = csv.DictWriter(
                 fh,
-                fieldnames=["tool", "threads", "repeat", "elapsed_s", "throughput_mb_s", "records", "error"],
+                fieldnames=["tool", "threads", "cache", "repeat", "elapsed_s", "throughput_mb_s", "records", "error"],
                 extrasaction="ignore",
             )
             if not args.append:
@@ -388,14 +446,16 @@ def main() -> None:
             for r in results:
                 if "error" in r:
                     writer.writerow({
-                        "tool": r["tool"], "threads": r["threads"], "repeat": "",
+                        "tool": r["tool"], "threads": r["threads"],
+                        "cache": r.get("cache", "cold"), "repeat": "",
                         "elapsed_s": "", "throughput_mb_s": "", "records": "",
                         "error": r["error"],
                     })
                 elif "all_elapsed" in r:
                     for i, elapsed in enumerate(r["all_elapsed"], args.repeat_index):
                         writer.writerow({
-                            "tool": r["tool"], "threads": r["threads"], "repeat": i,
+                            "tool": r["tool"], "threads": r["threads"],
+                            "cache": r.get("cache", "cold"), "repeat": i,
                             "elapsed_s": elapsed,
                             "throughput_mb_s": f"{bam_mb / elapsed:.1f}" if elapsed > 0 else "",
                             "records": r["records"],
@@ -403,7 +463,8 @@ def main() -> None:
                         })
                 else:
                     writer.writerow({
-                        "tool": r["tool"], "threads": r["threads"], "repeat": "",
+                        "tool": r["tool"], "threads": r["threads"],
+                        "cache": r.get("cache", "cold"), "repeat": "",
                         "elapsed_s": r.get("elapsed", ""),
                         "throughput_mb_s": f"{r['throughput']:.1f}" if "throughput" in r else "",
                         "records": r.get("records", ""),

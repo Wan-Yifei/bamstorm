@@ -7,6 +7,9 @@
 threads = [2, 4, 8, 16, 32, 64, 128]
 # Number of timed repetitions per configuration; the best (fastest) time is reported.
 repeats = 3
+# Number of warm-cache repetitions run after all cold runs (0 = skip).
+# No cache eviction between warm repeats; measures memory-bandwidth ceiling.
+warm_repeats = 1
 # Drop OS page cache before each run for cold-cache IO measurement.
 # Requires root on Linux; silently skipped otherwise.
 drop_cache = true

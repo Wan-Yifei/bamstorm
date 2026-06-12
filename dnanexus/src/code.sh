@@ -1,11 +1,17 @@
 #!/bin/bash
 # DNAnexus entry point for the bamstorm benchmark applet.
-# Inputs (set by dx-toolkit after dx-download-all-inputs):
-#   $bam_file_path   - local path to downloaded BAM file
-#   $bai_file_path   - local path to downloaded BAI file
-#   $docker_image    - Docker image reference (string)
-#   $threads         - comma-separated thread counts, e.g. "2,4,8,16"
-#   $repeats         - number of timed repetitions (int)
+#
+# Inputs (set by the platform after dx-download-all-inputs):
+#   $bam_file_N / $bai_file_N  - DNAnexus file IDs for BAM N and its index
+#   $docker_image              - Docker image reference (string)
+#   $threads                   - single thread count for this job (int)
+#   $repeats                   - number of timed repetitions per tool (int)
+#
+# Tool-to-BAM mapping (cold-cache isolation):
+#   bam 1 → bamstorm
+#   bam 2 → samtools
+#   bam 3 → rabbitbam
+#   bam 4 → pysam
 set -euo pipefail
 
 main() {
@@ -16,7 +22,6 @@ main() {
     echo "Threads : $threads"
     echo "Repeats : $repeats"
     echo ""
-
 
     # ── scratch directory (DNAnexus mounts NVMe RAID at /) ───────────────────
     echo "=== Storage layout ==="
@@ -52,25 +57,26 @@ print(f'{bw:.0f}')
     echo "Storage OK (${BANDWIDTH_MB} MB/s — local NVMe RAID with dm-crypt overhead expected)"
     echo ""
 
-    # ── download inputs directly to local NVMe ───────────────────────────────
-    # Skip dx-download-all-inputs (which lands on EBS root) and write straight
-    # to /mnt/work so the BAM never touches the slower network-backed root disk.
+    # ── download all 4 BAM/BAI pairs directly to local NVMe ─────────────────
     mkdir -p /mnt/work/data /mnt/work/results
 
-    echo "Downloading BAM..."
-    dx download "$bam_file" -o /mnt/work/data/input.bam --no-progress
-    dx download "$bai_file" -o /mnt/work/data/input.bam.bai --no-progress
-    echo "Download complete: $(du -h /mnt/work/data/input.bam | cut -f1)"
+    for N in 1 2 3 4; do
+        BAM_VAR="bam_file_${N}"
+        BAI_VAR="bai_file_${N}"
+        echo "Downloading BAM ${N}..."
+        dx download "${!BAM_VAR}" -o "/mnt/work/data/input${N}.bam" --no-progress
+        dx download "${!BAI_VAR}" -o "/mnt/work/data/input${N}.bam.bai" --no-progress
+        echo "  input${N}.bam : $(du -h /mnt/work/data/input${N}.bam | cut -f1)"
+    done
+    echo "All downloads complete."
+    echo ""
 
-    # ── generate bench.toml from job parameters ───────────────────────────────
-    # Convert comma-separated string "2,4,8" → TOML array [2, 4, 8]
-    threads_toml=$(echo "$threads" | sed 's/,/, /g')
-
+    # ── generate bench.toml ───────────────────────────────────────────────────
     cat > /mnt/work/bench.toml << TOML
 [benchmark]
-threads = [$threads_toml]
+threads = [$threads]
 repeats = $repeats
-drop_cache = true
+drop_cache = false
 
 [fio]
 enabled = true
@@ -85,15 +91,18 @@ TOML
     docker pull "$docker_image"
 
     # ── run benchmark ─────────────────────────────────────────────────────────
-    echo "Starting benchmark..."
+    echo "Starting benchmark (threads=$threads)..."
     docker run --rm \
         -v /mnt/work/data:/data \
         -v /mnt/work/results:/results \
         -v /mnt/work/bench.toml:/app/bench.toml:ro \
         "$docker_image" \
         python3 /app/bench.py \
-            /data/input.bam \
-            /data/input.bam.bai \
+            /data/input1.bam \
+            /data/input1.bam.bai \
+            --bam2 /data/input2.bam --bai2 /data/input2.bam.bai \
+            --bam3 /data/input3.bam --bai3 /data/input3.bam.bai \
+            --bam4 /data/input4.bam --bai4 /data/input4.bam.bai \
             --config /app/bench.toml \
             --csv /results/benchmark.csv \
         2>&1 | tee /mnt/work/results/bench.log

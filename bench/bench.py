@@ -209,8 +209,14 @@ def drop_caches(bam: str, bai: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="BAM benchmark")
-    parser.add_argument("bam", help="Path to BAM file")
-    parser.add_argument("bai", help="Path to BAI index file")
+    parser.add_argument("bam", help="Path to BAM file (used by bamstorm; fallback for all tools)")
+    parser.add_argument("bai", help="Path to BAI index file (paired with bam)")
+    parser.add_argument("--bam2", default=None, metavar="FILE", help="BAM for samtools (default: bam)")
+    parser.add_argument("--bai2", default=None, metavar="FILE", help="BAI for samtools")
+    parser.add_argument("--bam3", default=None, metavar="FILE", help="BAM for rabbitbam (default: bam)")
+    parser.add_argument("--bai3", default=None, metavar="FILE", help="BAI for rabbitbam")
+    parser.add_argument("--bam4", default=None, metavar="FILE", help="BAM for pysam (default: bam)")
+    parser.add_argument("--bai4", default=None, metavar="FILE", help="BAI for pysam")
     parser.add_argument(
         "--config", default=str(DEFAULT_CONFIG),
         help=f"Path to TOML config file (default: {DEFAULT_CONFIG})",
@@ -257,10 +263,20 @@ def main() -> None:
     warm_repeats = args.warm_repeats if args.warm_repeats is not None \
                    else cfg.get("benchmark", {}).get("warm_repeats", 0)
 
-    bam_mb = file_mb(args.bam)
+    # Per-tool BAM/BAI: fall back to the primary bam/bai if not specified.
+    # Tool assignment: bamstorm=bam1, samtools=bam2, rabbitbam=bam3, pysam=bam4
+    bam1, bai1 = args.bam, args.bai
+    bam2, bai2 = args.bam2 or args.bam, args.bai2 or args.bai
+    bam3, bai3 = args.bam3 or args.bam, args.bai3 or args.bai
+    bam4, bai4 = args.bam4 or args.bam, args.bai4 or args.bai
+
+    bam_mb = file_mb(bam1)
 
     print(f"\nConfig   : {args.config}")
-    print(f"BAM file : {args.bam}  ({bam_mb:.1f} MB)")
+    print(f"BAM 1 (bamstorm)  : {bam1}  ({bam_mb:.1f} MB)")
+    print(f"BAM 2 (samtools)  : {bam2}")
+    print(f"BAM 3 (rabbitbam) : {bam3}")
+    print(f"BAM 4 (pysam)     : {bam4}")
     print(f"CPU cores: {max_cpus}")
     print(f"Repeats  : cold={repeats} (best of N), warm={warm_repeats}")
     print(f"threads  : {default_threads} (bamstorm={bamstorm_threads} samtools={samtools_threads} "
@@ -310,11 +326,11 @@ def main() -> None:
             print("  fio not installed — skipped")
         print()
 
-    def run_repeats(fn, *fn_args) -> list[tuple[float, int]]:
+    def run_repeats(bam, bai, fn, *fn_args) -> list[tuple[float, int]]:
         runs = []
         for _ in range(repeats):
             if drop_cache:
-                drop_caches(args.bam, args.bai)
+                drop_caches(bam, bai)
             runs.append(fn(*fn_args))
         return runs
 
@@ -329,48 +345,48 @@ def main() -> None:
     def record_err(tool: str, threads: int, error: str, cache: str = "cold") -> dict:
         return {"tool": tool, "threads": threads, "cache": cache, "error": error}
 
-    # bamstorm
+    # bamstorm → bam1
     print("  [bamstorm]")
     for t in bamstorm_threads:
         try:
-            runs = run_repeats(run_bamstorm, args.bam, args.bai, t)
+            runs = run_repeats(bam1, bai1, run_bamstorm, bam1, bai1, t)
             r = record_ok("bamstorm", t, runs)
         except Exception as e:
             r = record_err("bamstorm", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 
-    # samtools
+    # samtools → bam2
     print()
     print("  [samtools]")
     for t in samtools_threads:
         try:
-            runs = run_repeats(run_samtools, args.bam, t)
+            runs = run_repeats(bam2, bai2, run_samtools, bam2, t)
             r = record_ok("samtools view -c", t, runs)
         except Exception as e:
             r = record_err("samtools view -c", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 
-    # rabbitbam
+    # rabbitbam → bam3
     print()
     print("  [rabbitbam]")
     for t in rabbitbam_threads:
         try:
-            runs = run_repeats(run_rabbitbam, args.bam, t)
+            runs = run_repeats(bam3, bai3, run_rabbitbam, bam3, t)
             r = record_ok("rabbitbam benchmark_count", t, runs)
         except Exception as e:
             r = record_err("rabbitbam benchmark_count", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 
-    # pysam
+    # pysam → bam4
     print()
     print("  [pysam]")
     if HAS_PYSAM:
         for t in pysam_threads:
             try:
-                runs = run_repeats(run_pysam, args.bam, t)
+                runs = run_repeats(bam4, bai4, run_pysam, bam4, t)
                 r = record_ok("pysam fetch(until_eof)", t, runs)
             except Exception as e:
                 r = record_err("pysam fetch(until_eof)", t, str(e))
@@ -388,7 +404,7 @@ def main() -> None:
         print("  [bamstorm]  [warm]")
         for t in bamstorm_threads:
             try:
-                runs = [run_bamstorm(args.bam, args.bai, t) for _ in range(warm_repeats)]
+                runs = [run_bamstorm(bam1, bai1, t) for _ in range(warm_repeats)]
                 r = record_ok("bamstorm", t, runs, cache="warm")
             except Exception as e:
                 r = record_err("bamstorm", t, str(e), cache="warm")
@@ -399,7 +415,7 @@ def main() -> None:
         print("  [samtools]  [warm]")
         for t in samtools_threads:
             try:
-                runs = [run_samtools(args.bam, t) for _ in range(warm_repeats)]
+                runs = [run_samtools(bam2, t) for _ in range(warm_repeats)]
                 r = record_ok("samtools view -c", t, runs, cache="warm")
             except Exception as e:
                 r = record_err("samtools view -c", t, str(e), cache="warm")
@@ -410,7 +426,7 @@ def main() -> None:
         print("  [rabbitbam]  [warm]")
         for t in rabbitbam_threads:
             try:
-                runs = [run_rabbitbam(args.bam, t) for _ in range(warm_repeats)]
+                runs = [run_rabbitbam(bam3, t) for _ in range(warm_repeats)]
                 r = record_ok("rabbitbam benchmark_count", t, runs, cache="warm")
             except Exception as e:
                 r = record_err("rabbitbam benchmark_count", t, str(e), cache="warm")
@@ -422,7 +438,7 @@ def main() -> None:
             print("  [pysam]  [warm]")
             for t in pysam_threads:
                 try:
-                    runs = [run_pysam(args.bam, t) for _ in range(warm_repeats)]
+                    runs = [run_pysam(bam4, t) for _ in range(warm_repeats)]
                     r = record_ok("pysam fetch(until_eof)", t, runs, cache="warm")
                 except Exception as e:
                     r = record_err("pysam fetch(until_eof)", t, str(e), cache="warm")

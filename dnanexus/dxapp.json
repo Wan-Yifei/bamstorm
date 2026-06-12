@@ -5,18 +5,60 @@
   "version": "0.1.0",
   "inputSpec": [
     {
-      "name": "bam_file",
-      "label": "BAM file",
+      "name": "bam_file_1",
+      "label": "BAM file 1 (bamstorm)",
       "class": "file",
       "patterns": ["*.bam"],
-      "help": "Input BAM file to benchmark"
+      "help": "BAM file used by bamstorm"
     },
     {
-      "name": "bai_file",
-      "label": "BAM index",
+      "name": "bai_file_1",
+      "label": "BAM index 1 (bamstorm)",
       "class": "file",
       "patterns": ["*.bai"],
-      "help": "Index file for the BAM (.bam.bai)"
+      "help": "Index for bam_file_1"
+    },
+    {
+      "name": "bam_file_2",
+      "label": "BAM file 2 (samtools)",
+      "class": "file",
+      "patterns": ["*.bam"],
+      "help": "BAM file used by samtools"
+    },
+    {
+      "name": "bai_file_2",
+      "label": "BAM index 2 (samtools)",
+      "class": "file",
+      "patterns": ["*.bai"],
+      "help": "Index for bam_file_2"
+    },
+    {
+      "name": "bam_file_3",
+      "label": "BAM file 3 (rabbitbam)",
+      "class": "file",
+      "patterns": ["*.bam"],
+      "help": "BAM file used by rabbitbam"
+    },
+    {
+      "name": "bai_file_3",
+      "label": "BAM index 3 (rabbitbam)",
+      "class": "file",
+      "patterns": ["*.bai"],
+      "help": "Index for bam_file_3"
+    },
+    {
+      "name": "bam_file_4",
+      "label": "BAM file 4 (pysam)",
+      "class": "file",
+      "patterns": ["*.bam"],
+      "help": "BAM file used by pysam"
+    },
+    {
+      "name": "bai_file_4",
+      "label": "BAM index 4 (pysam)",
+      "class": "file",
+      "patterns": ["*.bai"],
+      "help": "Index for bam_file_4"
     },
     {
       "name": "docker_image",
@@ -26,11 +68,9 @@
     },
     {
       "name": "threads",
-      "label": "Thread counts",
-      "class": "string",
-      "default": "1,2,4,8,16,32,64,96",
-      "optional": true,
-      "help": "Comma-separated thread counts to benchmark (e.g. '2,4,8,16')"
+      "label": "Thread count",
+      "class": "int",
+      "help": "Number of threads for this job (one job per thread count)"
     },
     {
       "name": "repeats",
@@ -38,7 +78,7 @@
       "class": "int",
       "default": 3,
       "optional": true,
-      "help": "Timed repetitions per configuration; fastest run is reported"
+      "help": "Timed repetitions per tool; fastest run is reported"
     }
   ],
   "outputSpec": [

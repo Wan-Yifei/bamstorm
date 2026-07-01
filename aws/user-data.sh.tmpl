@@ -1,0 +1,102 @@
+#!/bin/bash
+# EC2 user-data for the bamstorm AWS benchmark.
+# Templated by launch.sh -- placeholders are substituted with sed before
+# being passed to `aws ec2 run-instances --user-data`.
+# (ASCII only: this file is read back by `aws` via file://, which decodes
+# with the host's locale codepage -- non-ASCII bytes break that on Windows.)
+#
+# Tool-to-BAM mapping (cold-cache isolation, same as dnanexus/src/code.sh):
+#   bam 1 -> bamstorm
+#   bam 2 -> samtools
+#   bam 3 -> rabbitbam
+#   bam 4 -> pysam
+set -euo pipefail
+exec > >(tee /var/log/bamstorm-bench.log) 2>&1
+
+REGION="__REGION__"
+S3_BUCKET="__S3_BUCKET__"
+S3_BAM_KEY="__S3_BAM_KEY__"
+S3_BAI_KEY="__S3_BAI_KEY__"
+RESULT_PREFIX="__RESULT_PREFIX__"
+ECR_IMAGE_URI="__ECR_IMAGE_URI__"
+
+echo "=== Bamstorm AWS Benchmark ==="
+echo "Instance : $(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+echo "CPUs     : $(nproc)"
+echo "RAM      : $(free -h | awk '/^Mem/{print $2}')"
+echo "Image    : $ECR_IMAGE_URI"
+echo ""
+
+# -- find + mount local NVMe instance store (skip the EBS root disk) --------
+ROOT_DISK=$(lsblk -ndo PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null || true)
+NVME_DEV=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1}' | grep -v "^${ROOT_DISK}\$" | head -1)
+if [[ -z "$NVME_DEV" ]]; then
+    echo "ERROR: no local NVMe instance store on this instance type -- pick an i4i/i3en size." >&2
+    shutdown -h now
+    exit 1
+fi
+mkfs.ext4 -F "/dev/${NVME_DEV}"
+mkdir -p /mnt/work
+mount "/dev/${NVME_DEV}" /mnt/work
+echo "Mounted /dev/${NVME_DEV} at /mnt/work: $(df -h /mnt/work | tail -1)"
+mkdir -p /mnt/work/data /mnt/work/results
+
+# -- docker + awscli ----------------------------------------------------------
+apt-get update -y
+apt-get install -y --no-install-recommends docker.io awscli
+systemctl enable --now docker
+
+# -- ECR login + pull ----------------------------------------------------------
+aws ecr get-login-password --region "$REGION" \
+    | docker login --username AWS --password-stdin "${ECR_IMAGE_URI%%/*}"
+docker pull "$ECR_IMAGE_URI"
+
+# -- download 4 isolated BAM/BAI copies onto local NVMe ----------------------
+for N in 1 2 3 4; do
+    echo "Downloading copy ${N}..."
+    aws s3 cp "s3://${S3_BUCKET}/${S3_BAM_KEY}" "/mnt/work/data/input${N}.bam" --region "$REGION"
+    aws s3 cp "s3://${S3_BUCKET}/${S3_BAI_KEY}" "/mnt/work/data/input${N}.bam.bai" --region "$REGION"
+    touch "/mnt/work/data/input${N}.bam.bai"
+done
+
+# -- bench.toml: full thread sweep, real cold-cache reads --------------------
+cat > /mnt/work/bench.toml << 'TOML'
+[benchmark]
+threads = [1, 2, 4, 8, 16, 32, 64, 0]
+repeats = 3
+warm_repeats = 1
+drop_cache = true
+
+[fio]
+enabled = true
+size = "1g"
+runtime = 20
+numjobs_parallel = 0
+TOML
+
+# -- run benchmark -------------------------------------------------------------
+# --privileged: the container needs to write /proc/sys/vm/drop_caches, which
+# forces a real (non-advisory) page-cache eviction on the host kernel -- this
+# is what DNAnexus could not do (read-only /proc/sys, no root).
+docker run --rm --privileged \
+    -v /mnt/work/data:/data \
+    -v /mnt/work/results:/results \
+    -v /mnt/work/bench.toml:/app/bench.toml:ro \
+    "$ECR_IMAGE_URI" \
+    python3 /app/bench.py \
+        /data/input1.bam /data/input1.bam.bai \
+        --bam2 /data/input2.bam --bai2 /data/input2.bam.bai \
+        --bam3 /data/input3.bam --bai3 /data/input3.bam.bai \
+        --bam4 /data/input4.bam --bai4 /data/input4.bam.bai \
+        --config /app/bench.toml \
+        --csv /results/benchmark.csv \
+    2>&1 | tee /mnt/work/results/bench.log
+
+# -- upload results, then self-terminate --------------------------------------
+aws s3 cp /mnt/work/results/benchmark.csv "s3://${S3_BUCKET}/${RESULT_PREFIX}/benchmark.csv" --region "$REGION"
+aws s3 cp /mnt/work/results/bench.log     "s3://${S3_BUCKET}/${RESULT_PREFIX}/bench.log"     --region "$REGION"
+aws s3 cp /var/log/bamstorm-bench.log     "s3://${S3_BUCKET}/${RESULT_PREFIX}/boot.log"      --region "$REGION"
+
+echo "Done. Results: s3://${S3_BUCKET}/${RESULT_PREFIX}/"
+echo "Self-terminating."
+shutdown -h now

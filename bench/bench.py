@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -106,15 +107,34 @@ def detect_fs(path: str) -> str:
     return "unknown"
 
 
-def run_fio(tmpfile: str, numjobs: int, size: str, runtime: int):
-    """Return aggregate sequential read bandwidth in MB/s, or None on failure."""
+def _cached_kb() -> str:
+    """Return current OS page-cache size from /proc/meminfo, or 'N/A'."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("Cached:"):
+                    return line.split()[1] + " KB"
+    except OSError:
+        pass
+    return "N/A"
+
+
+def run_fio(fio_dir: str, numjobs: int, size: str, runtime: int):
+    """Return aggregate sequential read bandwidth in MB/s, or None on failure.
+
+    Uses a separate file per job (--directory, not --filename) so jobs do not
+    compete on the same file region, plus libaio + iodepth=32 to saturate the
+    NVMe command queue.  The original single-shared-file + sync-engine approach
+    under-measured i4i NVMe bandwidth by ~23x (122 MB/s vs real 2800 MB/s).
+    """
     cmd = [
         "fio", "--name=bamstorm-io",
         "--rw=read", "--bs=1M",
         f"--size={size}", f"--numjobs={numjobs}",
         f"--runtime={runtime}", "--time_based",
-        "--direct=1", "--group_reporting",
-        f"--filename={tmpfile}",
+        "--direct=1", "--ioengine=libaio", "--iodepth=32",
+        "--group_reporting",
+        f"--directory={fio_dir}",
         "--output-format=json",
     ]
     try:
@@ -172,6 +192,36 @@ def run_pysam(bam: str, threads: int) -> tuple[float, int]:
 
 
 def drop_caches(bam: str, bai: str) -> None:
+    """Evict bam/bai pages from the OS page cache for a true cold-cache read.
+
+    Tries the real kernel drop_caches sysctl first (works with root or
+    CAP_SYS_ADMIN, e.g. a --privileged container on EC2/HPC) — this is a
+    forced, non-advisory eviction. Falls back to the copy+fsync+fadvise
+    trick when that's not permitted (e.g. DNAnexus, where /proc/sys/vm is
+    read-only and fadvise alone proved unreliable on large-RAM machines).
+    """
+    mode = getattr(drop_caches, "_mode", None)
+    if mode is None:
+        try:
+            cached_before = _cached_kb()
+            with open("/proc/sys/vm/drop_caches", "w") as f:
+                f.write("3\n")
+            cached_after = _cached_kb()
+            print(
+                f"[info] drop_caches: real /proc/sys/vm/drop_caches (root) -- "
+                f"Cached {cached_before} -> {cached_after}",
+                flush=True,
+            )
+            drop_caches._mode = mode = "real"
+        except OSError:
+            print("[info] drop_caches: no root -- falling back to copy+fadvise(DONTNEED)", flush=True)
+            drop_caches._mode = mode = "fallback"
+
+    if mode == "real":
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+        return
+
     import ctypes, ctypes.util
     POSIX_FADV_DONTNEED = 4
     try:
@@ -302,16 +352,13 @@ def main() -> None:
         print("  [fio disk bandwidth]")
         if shutil.which("fio"):
             print(f"  filesystem : {detect_fs(args.bam)}")
-            tmpfile = os.path.join(fio_dir, ".bamstorm_fio.tmp")
+            fio_subdir = tempfile.mkdtemp(dir=fio_dir, prefix=".bamstorm_fio_")
             seq_bw = par_bw = None
             try:
-                seq_bw = run_fio(tmpfile, 1,         fio_size, fio_runtime)
-                par_bw = run_fio(tmpfile, fio_par_n, fio_size, fio_runtime)
+                seq_bw = run_fio(fio_subdir, 1,         fio_size, fio_runtime)
+                par_bw = run_fio(fio_subdir, fio_par_n, fio_size, fio_runtime)
             finally:
-                try:
-                    os.unlink(tmpfile)
-                except OSError:
-                    pass
+                shutil.rmtree(fio_subdir, ignore_errors=True)
             if seq_bw is not None:
                 print(f"  sequential (1 job)          : {seq_bw:8.1f} MB/s")
                 results.append({"tool": "fio-seq", "threads": 1,

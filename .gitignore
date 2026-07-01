@@ -254,3 +254,5 @@ __marimo__/
 .cargo/
 # AI assistant local memory
 .claude/
+bench/result/
+job-*.txt

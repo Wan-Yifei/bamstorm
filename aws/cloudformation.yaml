@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  bamstorm benchmark infrastructure.
+  Creates an ECR repository, an IAM role/instance-profile scoped to the
+  test S3 bucket and this ECR repo, ready for launch.sh / run_sweep.sh.
+  Docker build+push is handled separately by cfn-deploy.sh because
+  CloudFormation cannot execute local Docker commands.
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: dfci-bioinformatics-dev
+    Description: S3 bucket that holds the test BAM and receives benchmark results.
+  BamKeyPrefix:
+    Type: String
+    Default: test_15gb.bam
+    Description: >
+      S3 key of the test BAM (without extension). The role will be granted
+      GetObject on <BamKeyPrefix>* to cover both the BAM and its .bai index.
+
+Resources:
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: bamstorm-bench
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: false
+
+  BenchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bamstorm-bench-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bamstorm-bench-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ReadTestData
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/${BamKeyPrefix}*
+              - Sid: S3WriteResults
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/bamstorm-bench-results/*
+              - Sid: S3ListBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${S3BucketName}
+              - Sid: ECRAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: ECRPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !GetAtt ECRRepository.Arn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: bamstorm-bench-ec2-profile
+      Roles:
+        - !Ref BenchRole
+
+Outputs:
+  ECRRepositoryUri:
+    Description: Full ECR image URI (pass to launch.sh -i)
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+    Export:
+      Name: !Sub ${AWS::StackName}-ecr-uri
+
+  InstanceProfileName:
+    Description: Instance profile name (used by launch.sh internally)
+    Value: !Ref InstanceProfile
+    Export:
+      Name: !Sub ${AWS::StackName}-instance-profile

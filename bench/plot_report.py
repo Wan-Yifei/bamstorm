@@ -147,7 +147,8 @@ def plot_throughput(ax, cold_data, fio, warm_data=None):
         for td in list(cold_data.values()) + list((warm_data or {}).values())
         for vals in td.values()
     ]
-    max_y = max(all_vals) if all_vals else 1
+    fio_vals = list(fio.values())
+    max_y = max(all_vals + fio_vals) if (all_vals or fio_vals) else 1
 
     for tool, td in cold_data.items():
         xs    = sorted(td)

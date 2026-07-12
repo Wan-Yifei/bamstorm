@@ -264,6 +264,38 @@ pub fn count(bam_path: &str, bai_path: &str, until_eof: bool) -> PyResult<u64> {
         .map_err(to_py_err)
 }
 
+/// Count all BAM records in parallel without requiring a BAI index.
+///
+/// Divides the compressed file into thread-count equal chunks, locates BGZF
+/// block and BAM record boundaries via the QuickBAM heuristic, then counts
+/// records in each chunk with `count_records_in_virtual_range`.
+#[pyfunction]
+pub fn count_no_index(bam_path: &str) -> PyResult<u64> {
+    use crate::bam_parser::{
+        count_records_in_virtual_range, find_parallel_chunks_no_index, header_end_vpos,
+    };
+
+    let header = crate::get_bam_header(bam_path).map_err(to_py_err)?;
+    let n_ref = header.reference_sequences().len();
+    let ref_lens: Vec<u32> = header
+        .reference_sequences()
+        .values()
+        .map(|rs| rs.length().get() as u32)
+        .collect();
+
+    let hdr_end = header_end_vpos(bam_path).map_err(to_py_err)?;
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunks =
+        find_parallel_chunks_no_index(bam_path, n_threads, hdr_end, n_ref, &ref_lens)
+            .map_err(to_py_err)?;
+
+    chunks
+        .into_par_iter()
+        .map(|(start, end)| count_records_in_virtual_range(bam_path, start, end))
+        .sum::<io::Result<u64>>()
+        .map_err(to_py_err)
+}
+
 // ── BamRecord ─────────────────────────────────────────────────────────────────
 
 #[pyclass]
@@ -560,6 +592,7 @@ impl AlignmentFile {
 #[pymodule]
 pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count, m)?)?;
+    m.add_function(wrap_pyfunction!(count_no_index, m)?)?;
     m.add_class::<AlignmentFile>()?;
     m.add_class::<BamRecord>()?;
     m.add_class::<RecordIterator>()?;

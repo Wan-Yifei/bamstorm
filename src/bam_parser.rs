@@ -136,7 +136,7 @@ pub fn merge_intervals(
 /// on a real record. Any interval whose start is VirtualPosition(0,0) must be adjusted
 /// to this position so that count_records_in_virtual_range does not parse header bytes
 /// as record data.
-fn header_end_vpos(bam_path: &str) -> io::Result<VirtualPosition> {
+pub(crate) fn header_end_vpos(bam_path: &str) -> io::Result<VirtualPosition> {
     let file = File::open(bam_path)?;
     let bgzf = bgzf_io::Reader::new(file);
     let mut bam_reader = bam::io::Reader::from(bgzf);
@@ -203,6 +203,108 @@ pub fn get_entire_bam_reader(
     }
 
     Ok(all_interval_readers)
+}
+
+/// Splits a BAM file into parallel read intervals without a BAI index.
+///
+/// Uses the QuickBAM heuristic (SuppMethods.docx): divide the compressed file
+/// into N equal byte ranges, find the BGZF block boundary at each range start
+/// via magic-byte scan, decompress that block, and locate the first valid BAM
+/// record via `is_valid_bam_record_start`.  Returns VirtualPosition pairs
+/// compatible with `count_records_in_virtual_range` and `read_bam_by_interval`.
+///
+/// `header_end` (from `header_end_vpos`) is the minimum allowed chunk start so
+/// that BAM header bytes are never mistaken for record data.
+pub fn find_parallel_chunks_no_index(
+    bam_path: &str,
+    n_chunks: usize,
+    header_end: VirtualPosition,
+    n_ref: usize,
+    ref_lens: &[u32],
+) -> io::Result<Vec<(VirtualPosition, VirtualPosition)>> {
+    let file_size = File::open(bam_path)?.metadata()?.len() as usize;
+    const BGZF_EOF_LEN: usize = 28;
+    let data_end = file_size.saturating_sub(BGZF_EOF_LEN);
+    let eof_vp = VirtualPosition::new(data_end as u64, 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BAM file too large"))?;
+
+    if n_chunks <= 1 || data_end == 0 {
+        return Ok(vec![(header_end, eof_vp)]);
+    }
+
+    let bytes_per_chunk = data_end / n_chunks;
+    let mut starts: Vec<VirtualPosition> = vec![header_end];
+
+    for i in 1..n_chunks {
+        let target = i * bytes_per_chunk;
+        if target >= data_end {
+            break;
+        }
+
+        // Raw compressed bytes: 2× max-block so the found block always fits fully.
+        let window_len = (131_072usize + 28).min(data_end - target);
+        let mut window = vec![0u8; window_len];
+        {
+            let mut f = File::open(bam_path)?;
+            f.seek(SeekFrom::Start(target as u64))?;
+            f.read_exact(&mut window)?;
+        }
+
+        let off = match find_next_bgzf_block(&window, 0) {
+            Some(p) => p,
+            None => continue,
+        };
+        let block_start = target + off;
+        if block_start >= data_end {
+            break;
+        }
+
+        // BSIZE (total block bytes) and ISIZE (uncompressed bytes) from header/footer.
+        if off + 18 > window.len() {
+            continue;
+        }
+        let bsize = u16::from_le_bytes([window[off + 16], window[off + 17]]) as usize + 1;
+        if off + bsize > window.len() {
+            continue;
+        }
+        let isize_raw: [u8; 4] = window[off + bsize - 4..off + bsize].try_into().unwrap();
+        let isize = u32::from_le_bytes(isize_raw) as usize;
+        if isize == 0 {
+            continue;
+        }
+
+        // Decompress the block via noodles BGZF reader.
+        let vp_block = VirtualPosition::new(block_start as u64, 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block offset overflow"))?;
+        let mut bgzf = bgzf_io::Reader::new(File::open(bam_path)?);
+        bgzf.seek(vp_block)?;
+        let mut buf = vec![0u8; isize];
+        bgzf.read_exact(&mut buf)?;
+
+        // Scan for the first valid BAM record start.
+        let Some(u) = (0..isize).find(|&u| is_valid_bam_record_start(&buf, u, n_ref, ref_lens))
+        else {
+            continue;
+        };
+        let Some(vp) = VirtualPosition::new(block_start as u64, u as u16) else {
+            continue;
+        };
+
+        if vp > header_end && starts.last().copied() != Some(vp) {
+            starts.push(vp);
+        }
+    }
+
+    starts.dedup();
+
+    // Build (start, end) pairs: each chunk ends where the next begins.
+    let intervals: Vec<(VirtualPosition, VirtualPosition)> = starts
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .chain(starts.last().copied().map(|last| (last, eof_vp)))
+        .collect();
+
+    Ok(intervals)
 }
 
 // ── Step 14 building blocks: no-index parallel reading ────────────────────────
@@ -435,6 +537,37 @@ mod test {
         assert_eq!(
             merged_count, standard_count,
             "merged intervals count must match standard reader"
+        );
+        Ok(())
+    }
+
+    // ── Step 14: no-index parallel count ──────────────────────────────────────
+
+    #[test]
+    fn test_count_no_index_matches_sequential() -> Result<(), Box<dyn std::error::Error>> {
+        use rayon::prelude::*;
+
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let n_ref = header.reference_sequences().len();
+        let ref_lens: Vec<u32> = header
+            .reference_sequences()
+            .values()
+            .map(|rs| rs.length().get() as u32)
+            .collect();
+        let hdr_end = header_end_vpos(TEST_BAM)?;
+
+        let chunks = find_parallel_chunks_no_index(TEST_BAM, 4, hdr_end, n_ref, &ref_lens)?;
+        assert!(!chunks.is_empty(), "should produce at least one chunk");
+
+        let count_no_idx: u64 = chunks
+            .into_par_iter()
+            .map(|(start, end)| count_records_in_virtual_range(TEST_BAM, start, end))
+            .sum::<io::Result<u64>>()?;
+
+        let sequential = crate::count_from_standard_bam_reader(TEST_BAM, 1)?;
+        assert_eq!(
+            count_no_idx, sequential,
+            "no-index parallel count {count_no_idx} != sequential {sequential}"
         );
         Ok(())
     }

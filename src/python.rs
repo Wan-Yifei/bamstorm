@@ -7,10 +7,10 @@ use crate::{
     bam_parser::{get_entire_bam_intervals, merge_intervals, read_bam_by_interval},
 };
 use noodles::bam as noodles_bam;
+use noodles::core::Region;
 use noodles::sam as noodles_sam;
 use noodles::sam::alignment::RecordBuf;
 use rayon::prelude::*;
-use rust_htslib::{bam, bam::Read as HtsRead, errors::Error as HtsError};
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::types::PyBytes;
@@ -45,17 +45,6 @@ fn tag_owned_to_py(py: Python<'_>, v: &TagOwned) -> PyObject {
 
 // ── CIGAR helpers ─────────────────────────────────────────────────────────────
 
-// htslib BAM_C* integer codes for CIGAR operations.
-fn cigar_op_code(op: &bam::record::Cigar) -> u32 {
-    use bam::record::Cigar::*;
-    match op {
-        Match(_) => 0, Ins(_) => 1, Del(_) => 2, RefSkip(_) => 3,
-        SoftClip(_) => 4, HardClip(_) => 5, Pad(_) => 6,
-        Equal(_) => 7, Diff(_) => 8,
-        _ => 9,
-    }
-}
-
 fn cigar_kind_to_code(kind: noodles_sam::alignment::record::cigar::op::Kind) -> u32 {
     use noodles_sam::alignment::record::cigar::op::Kind::*;
     match kind {
@@ -87,47 +76,7 @@ struct RecordData {
 }
 
 impl RecordData {
-    // Rust-htslib path: used for contig/region fetches. No tags.
-    fn from_hts(rec: &bam::Record) -> Self {
-        let query_name = std::str::from_utf8(rec.qname()).ok().map(String::from);
-
-        let cigar = rec.cigar();
-        let cigarstring = if cigar.is_empty() {
-            "*".to_string()
-        } else {
-            cigar.to_string()
-        };
-        let cigartuples: Vec<(u32, u32)> = cigar.iter()
-            .map(|op| (cigar_op_code(op), op.len()))
-            .collect();
-
-        let query_sequence = String::from_utf8(rec.seq().as_bytes()).unwrap_or_default();
-
-        let qual = rec.qual();
-        let query_qualities = if qual.is_empty() || qual[0] == 0xFF {
-            None
-        } else {
-            Some(qual.to_vec())
-        };
-
-        RecordData {
-            query_name,
-            flag: rec.flags(),
-            reference_id: rec.tid(),
-            reference_start: rec.pos(),
-            mapping_quality: rec.mapq(),
-            cigarstring,
-            cigartuples,
-            query_sequence,
-            query_qualities,
-            template_length: rec.insert_size() as i32,
-            next_reference_id: rec.mtid(),
-            next_reference_start: rec.mpos(),
-            tags: vec![],
-        }
-    }
-
-    // Noodles path: used for parallel BAI-interval fetch and until_eof.
+    // Noodles path: used for all fetch paths.
     // RecordBuf converts the lazy BAM record into fully-owned fields including tags.
     fn from_noodles(
         rec: &noodles_bam::Record,
@@ -253,34 +202,44 @@ impl RecordData {
     }
 }
 
-// Open an IndexedReader and fetch all records for one reference sequence.
-// Each rayon worker calls this with its own file handle.
-fn fetch_chromosome(bam_path: &str, name: &str) -> Result<Vec<RecordData>, HtsError> {
-    let mut reader = bam::IndexedReader::from_path(bam_path)?;
-    reader.fetch(name)?;
-    let mut recs = Vec::new();
-    let mut record = bam::Record::new();
-    while let Some(r) = reader.read(&mut record) {
-        r?;
-        recs.push(RecordData::from_hts(&record));
-    }
-    Ok(recs)
-}
-
-// Fetch records in a named region [start, stop).
-fn fetch_region(
+// Fetch records overlapping a contig or region via noodles indexed reader.
+// Coordinates follow pysam convention: 0-based half-open [start, stop).
+// When both start and stop are None the entire contig is returned.
+fn fetch_contig_or_region(
     bam_path: &str,
+    bai_path: &str,
+    header: &noodles_sam::Header,
     contig: &str,
-    start: i64,
-    stop: i64,
-) -> Result<Vec<RecordData>, HtsError> {
-    let mut reader = bam::IndexedReader::from_path(bam_path)?;
-    reader.fetch((contig, start, stop))?;
+    start: Option<i64>,
+    stop: Option<i64>,
+) -> io::Result<Vec<RecordData>> {
+    // Build noodles Region (1-based closed intervals).
+    // pysam [s, e) 0-based → noodles [s+1, e] 1-based.
+    let region: Region = match (start, stop) {
+        (None, None) => contig.parse()
+            .map_err(|e: noodles::core::region::ParseError|
+                io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?,
+        (s, e) => {
+            let s1 = s.unwrap_or(0) + 1;
+            let region_str = match e {
+                Some(end) => format!("{contig}:{s1}-{end}"),
+                None      => format!("{contig}:{s1}"),
+            };
+            region_str.parse()
+                .map_err(|e: noodles::core::region::ParseError|
+                    io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+        }
+    };
+
+    let index = noodles_bam::bai::fs::read(bai_path)?;
+    let mut reader = noodles_bam::io::indexed_reader::Builder::default()
+        .set_index(index)
+        .build_from_path(bam_path)?;
+    let _ = reader.read_header()?;
+
     let mut recs = Vec::new();
-    let mut record = bam::Record::new();
-    while let Some(r) = reader.read(&mut record) {
-        r?;
-        recs.push(RecordData::from_hts(&record));
+    for result in reader.query(header, &region)?.records() {
+        recs.push(RecordData::from_noodles(&result?, header)?);
     }
     Ok(recs)
 }
@@ -492,8 +451,8 @@ impl AlignmentFile {
     /// Parallel record fetch.
     ///
     /// fetch()                    → all mapped records via BAI intervals (noodles, tags included)
-    /// fetch(contig)              → one chromosome (rust-htslib, no tags)
-    /// fetch(contig, start, stop) → region [start, stop) (rust-htslib, no tags)
+    /// fetch(contig)              → one chromosome via BAI bin-index (noodles, tags included)
+    /// fetch(contig, start, stop) → region [start, stop) 0-based (noodles, tags included)
     /// until_eof=True             → all records including unmapped, sequential (noodles, tags included)
     #[pyo3(signature = (contig = None, start = None, stop = None, until_eof = false))]
     pub fn fetch(
@@ -507,15 +466,10 @@ impl AlignmentFile {
         let bai_path = self.bai_path.clone();
 
         let records: Vec<RecordData> = if let Some(ctg) = contig {
-            // Region / chromosome fetch via rust-htslib (BAI bin-index lookup).
-            // Tags not available on this path.
-            let s = start.unwrap_or(0);
-            let e = stop.unwrap_or(i64::MAX);
-            if start.is_none() && stop.is_none() {
-                fetch_chromosome(&bam_path, ctg).map_err(to_py_err)?
-            } else {
-                fetch_region(&bam_path, ctg, s, e).map_err(to_py_err)?
-            }
+            // Region / chromosome fetch via noodles indexed reader (BAI bin-index query).
+            let header = crate::get_bam_header(&bam_path).map_err(to_py_err)?;
+            fetch_contig_or_region(&bam_path, &bai_path, &header, ctg, start, stop)
+                .map_err(to_py_err)?
         } else if until_eof {
             // Sequential noodles reader — includes unmapped reads at EOF.
             let file = File::open(&bam_path).map_err(to_py_err)?;
@@ -596,50 +550,62 @@ mod tests {
 
     #[test]
     fn test_sequential_count_matches_noodles() -> Result<(), Box<dyn std::error::Error>> {
-        let mut reader = bam::Reader::from_path(TEST_BAM)?;
-        let mut record = bam::Record::new();
-        let mut hts_count = 0u64;
-        while let Some(r) = reader.read(&mut record) {
-            r?;
-            hts_count += 1;
-        }
-        let noodles_count = crate::count_from_standard_bam_reader(TEST_BAM, 1)?;
-        assert_eq!(
-            hts_count, noodles_count,
-            "htslib sequential count {hts_count} != noodles {noodles_count}"
-        );
+        // Verify parallel BAI-interval count equals sequential noodles reader count.
+        let noodles_seq = crate::count_from_standard_bam_reader(TEST_BAM, 1)? as usize;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let linear_indexes = get_linear_indexes(&bai_path)?;
+        let intervals = get_linear_intervals(&linear_indexes)?;
+        let all = crate::bam_parser::get_entire_bam_intervals(TEST_BAM, &intervals)?;
+        let chunks = crate::bam_parser::merge_intervals(&all, rayon::current_num_threads().max(1));
+        let par_count: usize = chunks
+            .into_par_iter()
+            .map(|(s, e)| crate::bam_parser::read_bam_by_interval(TEST_BAM, s, e)
+                .map(|mut r| r.records().count()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter().sum();
+        assert_eq!(par_count, noodles_seq,
+            "parallel interval count {par_count} != sequential noodles {noodles_seq}");
         Ok(())
     }
 
     #[test]
     fn test_fetch_chrm_count_matches_sequential() -> Result<(), Box<dyn std::error::Error>> {
-        let indexed = fetch_chromosome(TEST_BAM, CHR_M)?;
-        assert!(!indexed.is_empty(), "expected records on {CHR_M}");
+        use noodles_sam::alignment::Record as _;
 
-        let mut reader = bam::IndexedReader::from_path(TEST_BAM)?;
-        let header = reader.header().clone();
-        let chrm_tid = (0..header.target_count())
-            .find(|&i| header.tid2name(i) == CHR_M.as_bytes())
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let fetched = fetch_contig_or_region(TEST_BAM, &bai_path, &header, CHR_M, None, None)?;
+        assert!(!fetched.is_empty(), "expected records on {CHR_M}");
+
+        // Sequential reader filtered to chrM as ground truth.
+        let (chrm_id, _, _) = header.reference_sequences()
+            .get_full(CHR_M.as_bytes())
             .ok_or("chrM not found in header")?;
-        reader.fetch(chrm_tid)?;
-        let mut seq_count = 0usize;
-        let mut record = bam::Record::new();
-        while let Some(r) = reader.read(&mut record) {
-            r?;
-            seq_count += 1;
-        }
+        let file = File::open(TEST_BAM)?;
+        let mut reader = noodles_bam::io::Reader::new(file);
+        let _ = reader.read_header()?;
+        let seq_count = reader.records()
+            .filter_map(|r| r.ok())
+            .filter(|rec| {
+                rec.reference_sequence_id().transpose().ok().flatten()
+                    .map(|id| id == chrm_id)
+                    .unwrap_or(false)
+            })
+            .count();
 
         assert_eq!(
-            indexed.len(), seq_count,
-            "fetch_chromosome count {} != direct IndexedReader count {}",
-            indexed.len(), seq_count
+            fetched.len(), seq_count,
+            "fetch_contig_or_region count {} != sequential filter count {}",
+            fetched.len(), seq_count
         );
         Ok(())
     }
 
     #[test]
     fn test_mapped_record_fields_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let recs = fetch_contig_or_region(TEST_BAM, &bai_path, &header, CHR_M, None, None)?;
         assert!(!recs.is_empty());
 
         for r in recs.iter().filter(|r| r.flag & 0x004 == 0) {
@@ -672,9 +638,11 @@ mod tests {
 
     #[test]
     fn test_fetch_region_subset_and_bounds() -> Result<(), Box<dyn std::error::Error>> {
-        let all    = fetch_chromosome(TEST_BAM, CHR_M)?;
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let all    = fetch_contig_or_region(TEST_BAM, &bai_path, &header, CHR_M, None, None)?;
         let stop   = 2_000i64;
-        let region = fetch_region(TEST_BAM, CHR_M, 0, stop)?;
+        let region = fetch_contig_or_region(TEST_BAM, &bai_path, &header, CHR_M, Some(0), Some(stop))?;
 
         assert!(
             region.len() < all.len(),
@@ -692,7 +660,9 @@ mod tests {
 
     #[test]
     fn test_flag_getters_consistent() -> Result<(), Box<dyn std::error::Error>> {
-        let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let recs = fetch_contig_or_region(TEST_BAM, &bai_path, &header, CHR_M, None, None)?;
         assert!(!recs.is_empty());
         for d in &recs {
             let f = d.flag;
@@ -729,18 +699,16 @@ mod tests {
 
     #[test]
     fn test_header_chrm_length() -> Result<(), Box<dyn std::error::Error>> {
-        let reader = bam::IndexedReader::from_path(TEST_BAM)?;
-        let header = reader.header();
-        assert!(header.target_count() > 0);
-        let chrm_tid = (0..header.target_count())
-            .find(|&i| header.tid2name(i) == CHR_M.as_bytes())
+        let header = crate::get_bam_header(TEST_BAM)?;
+        assert!(header.reference_sequences().len() > 0);
+        let (_, _, chrm_seq) = header.reference_sequences()
+            .get_full(CHR_M.as_bytes())
             .ok_or("chrM not found in header")?;
-        let len = header.target_len(chrm_tid).ok_or("chrM has no length in header")?;
-        assert_eq!(len, 16569, "chrM length should be 16569 bp");
+        assert_eq!(chrm_seq.length().get(), 16569, "chrM length should be 16569 bp");
         Ok(())
     }
 
-    // Noodles parallel fetch must return the same record count as the htslib sequential path.
+    // Noodles parallel fetch must return the same total count as the sequential reader.
     #[test]
     fn test_noodles_fetch_count_matches_htslib() -> Result<(), Box<dyn std::error::Error>> {
         use crate::bai_parser::{get_linear_indexes, get_linear_intervals};
@@ -770,13 +738,13 @@ mod tests {
             .into_iter()
             .sum();
 
-        let hts_count: usize = fetch_chromosome(TEST_BAM, CHR_M)?.len();
+        let bai_path2 = format!("{}.bai", TEST_BAM);
+        let chrm_count = fetch_contig_or_region(TEST_BAM, &bai_path2, &header, CHR_M, None, None)?.len();
 
-        // noodles_count covers all chromosomes; hts_count is chrM only.
-        // Just verify noodles_count >= hts_count (chrM is a subset).
+        // noodles_count covers all chromosomes; chrm_count is chrM only.
         assert!(
-            noodles_count >= hts_count,
-            "noodles total {noodles_count} should be >= chrM htslib {hts_count}"
+            noodles_count >= chrm_count,
+            "noodles total {noodles_count} should be >= chrM count {chrm_count}"
         );
 
         // Also verify against noodles standard reader.

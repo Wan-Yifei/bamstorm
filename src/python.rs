@@ -4,28 +4,68 @@
 
 use crate::{
     bai_parser::{get_linear_indexes, get_linear_intervals},
-    bam_parser::{count_records_in_virtual_range, get_entire_bam_intervals, merge_intervals},
+    bam_parser::{get_entire_bam_intervals, merge_intervals, read_bam_by_interval},
 };
+use noodles::bam as noodles_bam;
+use noodles::sam as noodles_sam;
+use noodles::sam::alignment::RecordBuf;
 use rayon::prelude::*;
 use rust_htslib::{bam, bam::Read as HtsRead, errors::Error as HtsError};
 use pyo3::prelude::*;
-use pyo3::exceptions::PyIOError;
+use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::types::PyBytes;
+use std::fs::File;
 use std::io;
 
 fn to_py_err<E: ToString>(e: E) -> PyErr {
     PyIOError::new_err(e.to_string())
 }
 
-// BAM CIGAR op integer codes, matching pysam / htslib BAM_C* constants.
+// ── tag value storage ─────────────────────────────────────────────────────────
+// Owned representation of a BAM auxiliary tag value.
+
+#[derive(Clone, Debug)]
+enum TagOwned {
+    Int(i64),
+    Float(f32),
+    Str(String),
+    IntArray(Vec<i64>),
+    FloatArray(Vec<f32>),
+}
+
+fn tag_owned_to_py(py: Python<'_>, v: &TagOwned) -> PyObject {
+    match v {
+        TagOwned::Int(i)         => i.into_py(py),
+        TagOwned::Float(f)       => f.into_py(py),
+        TagOwned::Str(s)         => s.into_py(py),
+        TagOwned::IntArray(a)    => a.clone().into_py(py),
+        TagOwned::FloatArray(a)  => a.clone().into_py(py),
+    }
+}
+
+// ── CIGAR helpers ─────────────────────────────────────────────────────────────
+
+// htslib BAM_C* integer codes for CIGAR operations.
 fn cigar_op_code(op: &bam::record::Cigar) -> u32 {
     use bam::record::Cigar::*;
     match op {
         Match(_) => 0, Ins(_) => 1, Del(_) => 2, RefSkip(_) => 3,
         SoftClip(_) => 4, HardClip(_) => 5, Pad(_) => 6,
-        Equal(_) => 7, Diff(_) => 8, Back(_) => 9,
+        Equal(_) => 7, Diff(_) => 8,
+        _ => 9,
     }
 }
+
+fn cigar_kind_to_code(kind: noodles_sam::alignment::record::cigar::op::Kind) -> u32 {
+    use noodles_sam::alignment::record::cigar::op::Kind::*;
+    match kind {
+        Match => 0, Insertion => 1, Deletion => 2, Skip => 3,
+        SoftClip => 4, HardClip => 5, Pad => 6,
+        SequenceMatch => 7, SequenceMismatch => 8,
+    }
+}
+
+const CIGAR_CHARS: [char; 9] = ['M', 'I', 'D', 'N', 'S', 'H', 'P', '=', 'X'];
 
 // ── intermediate struct ───────────────────────────────────────────────────────
 // Extracted inside rayon workers (no GIL); Python objects built on iteration.
@@ -43,9 +83,11 @@ struct RecordData {
     template_length:      i32,
     next_reference_id:    i32,
     next_reference_start: i64,
+    tags:                 Vec<([u8; 2], TagOwned)>,
 }
 
 impl RecordData {
+    // Rust-htslib path: used for contig/region fetches. No tags.
     fn from_hts(rec: &bam::Record) -> Self {
         let query_name = std::str::from_utf8(rec.qname()).ok().map(String::from);
 
@@ -61,7 +103,6 @@ impl RecordData {
 
         let query_sequence = String::from_utf8(rec.seq().as_bytes()).unwrap_or_default();
 
-        // htslib stores absent quality as all-0xFF; pysam returns None in that case.
         let qual = rec.qual();
         let query_qualities = if qual.is_empty() || qual[0] == 0xFF {
             None
@@ -82,7 +123,133 @@ impl RecordData {
             template_length: rec.insert_size() as i32,
             next_reference_id: rec.mtid(),
             next_reference_start: rec.mpos(),
+            tags: vec![],
         }
+    }
+
+    // Noodles path: used for parallel BAI-interval fetch and until_eof.
+    // RecordBuf converts the lazy BAM record into fully-owned fields including tags.
+    fn from_noodles(
+        rec: &noodles_bam::Record,
+        header: &noodles_sam::Header,
+    ) -> io::Result<Self> {
+        // Bring SAM alignment record traits into scope so their methods resolve.
+        use noodles_sam::alignment::record::Cigar as CigarTrait;
+        use noodles_sam::alignment::record::Sequence as SequenceTrait;
+        // The record_buf's Data uses record_buf::data::field::Value, distinct from
+        // record::data::field::Value.
+        use noodles_sam::alignment::record_buf::data::field::Value as TagValue;
+
+        let buf = RecordBuf::try_from_alignment_record(header, rec)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let query_name = buf.name()
+            .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
+            .map(String::from);
+
+        let flag = buf.flags().bits();
+
+        let reference_id = buf.reference_sequence_id()
+            .map(|id| id as i32)
+            .unwrap_or(-1);
+
+        let reference_start = buf.alignment_start()
+            .map(|pos| usize::from(pos) as i64 - 1)
+            .unwrap_or(-1);
+
+        let mapping_quality = buf.mapping_quality()
+            .map(u8::from)
+            .unwrap_or(255);
+
+        // CigarTrait::iter() yields io::Result<Op>; filter_map drops any decode errors.
+        let cigartuples: Vec<(u32, u32)> = buf.cigar()
+            .iter()
+            .filter_map(|r| r.ok())
+            .map(|op| (cigar_kind_to_code(op.kind()), op.len() as u32))
+            .collect();
+
+        let cigarstring = if cigartuples.is_empty() {
+            "*".to_string()
+        } else {
+            cigartuples.iter()
+                .map(|&(op, len)| format!("{}{}", len, CIGAR_CHARS[op as usize]))
+                .collect()
+        };
+
+        // SequenceTrait has no iter(); use indexed get().
+        let seq = buf.sequence();
+        let query_sequence: String = (0..seq.len())
+            .filter_map(|i| seq.get(i))
+            .map(char::from)
+            .collect();
+
+        // record_buf::QualityScores::iter() yields u8 by value.
+        let qual: Vec<u8> = buf.quality_scores().iter().collect();
+        let query_qualities = if qual.is_empty() || qual.first() == Some(&0xFF) {
+            None
+        } else {
+            Some(qual)
+        };
+
+        let template_length = buf.template_length();
+
+        let next_reference_id = buf.mate_reference_sequence_id()
+            .map(|id| id as i32)
+            .unwrap_or(-1);
+
+        let next_reference_start = buf.mate_alignment_start()
+            .map(|pos| usize::from(pos) as i64 - 1)
+            .unwrap_or(-1);
+
+        let tags = buf.data().iter()
+            .map(|(tag, value)| {
+                // as_ref() gives &[u8; 2]; dereference to copy the 2-byte array.
+                let tag_bytes: [u8; 2] = *tag.as_ref();
+
+                let owned = match value {
+                    TagValue::Character(c) => TagOwned::Str(c.to_string()),
+                    TagValue::Int8(v)   => TagOwned::Int(*v as i64),
+                    TagValue::UInt8(v)  => TagOwned::Int(*v as i64),
+                    TagValue::Int16(v)  => TagOwned::Int(*v as i64),
+                    TagValue::UInt16(v) => TagOwned::Int(*v as i64),
+                    TagValue::Int32(v)  => TagOwned::Int(*v as i64),
+                    TagValue::UInt32(v) => TagOwned::Int(*v as i64),
+                    TagValue::Float(v)  => TagOwned::Float(*v),
+                    TagValue::String(s) => TagOwned::Str(s.to_string()),
+                    TagValue::Hex(s)    => TagOwned::Str(s.to_string()),
+                    TagValue::Array(arr) => {
+                        use noodles_sam::alignment::record_buf::data::field::value::Array;
+                        // record_buf Array variants hold owned plain values.
+                        match arr {
+                            Array::Int8(vs)   => TagOwned::IntArray(vs.iter().map(|&v| v as i64).collect()),
+                            Array::UInt8(vs)  => TagOwned::IntArray(vs.iter().map(|&v| v as i64).collect()),
+                            Array::Int16(vs)  => TagOwned::IntArray(vs.iter().map(|&v| v as i64).collect()),
+                            Array::UInt16(vs) => TagOwned::IntArray(vs.iter().map(|&v| v as i64).collect()),
+                            Array::Int32(vs)  => TagOwned::IntArray(vs.iter().map(|&v| v as i64).collect()),
+                            Array::UInt32(vs) => TagOwned::IntArray(vs.iter().map(|&v| v as i64).collect()),
+                            Array::Float(vs)  => TagOwned::FloatArray(vs.iter().copied().collect()),
+                        }
+                    }
+                };
+                (tag_bytes, owned)
+            })
+            .collect();
+
+        Ok(RecordData {
+            query_name,
+            flag,
+            reference_id,
+            reference_start,
+            mapping_quality,
+            cigarstring,
+            cigartuples,
+            query_sequence,
+            query_qualities,
+            template_length,
+            next_reference_id,
+            next_reference_start,
+            tags,
+        })
     }
 }
 
@@ -90,7 +257,6 @@ impl RecordData {
 // Each rayon worker calls this with its own file handle.
 fn fetch_chromosome(bam_path: &str, name: &str) -> Result<Vec<RecordData>, HtsError> {
     let mut reader = bam::IndexedReader::from_path(bam_path)?;
-    // fetch(name) retrieves all records on that chromosome without a position filter.
     reader.fetch(name)?;
     let mut recs = Vec::new();
     let mut record = bam::Record::new();
@@ -120,32 +286,23 @@ fn fetch_region(
 }
 
 // ── count ─────────────────────────────────────────────────────────────────────
-// Noodles-based fast path: skips field parsing entirely.
 
 #[pyfunction]
 #[pyo3(signature = (bam_path, bai_path, until_eof = false))]
 pub fn count(bam_path: &str, bai_path: &str, until_eof: bool) -> PyResult<u64> {
+    use crate::bam_parser::count_records_in_virtual_range;
     let linear_indexes = get_linear_indexes(bai_path).map_err(to_py_err)?;
     let intervals = get_linear_intervals(&linear_indexes).map_err(to_py_err)?;
     let all = get_entire_bam_intervals(bam_path, &intervals).map_err(to_py_err)?;
     let threads = rayon::current_num_threads().max(1);
     let chunks = merge_intervals(&all, threads);
 
-    if until_eof {
-        chunks
-            .into_par_iter()
-            .map(|(start, end)| count_records_in_virtual_range(bam_path, start, end))
-            .sum::<io::Result<u64>>()
-            .map_err(to_py_err)
-    } else {
-        // Mapped reads only: the BAI linear index covers only mapped positions,
-        // so records counted here are all mapped.
-        chunks
-            .into_par_iter()
-            .map(|(start, end)| count_records_in_virtual_range(bam_path, start, end))
-            .sum::<io::Result<u64>>()
-            .map_err(to_py_err)
-    }
+    let _ = until_eof;
+    chunks
+        .into_par_iter()
+        .map(|(start, end)| count_records_in_virtual_range(bam_path, start, end))
+        .sum::<io::Result<u64>>()
+        .map_err(to_py_err)
 }
 
 // ── BamRecord ─────────────────────────────────────────────────────────────────
@@ -164,6 +321,7 @@ pub struct BamRecord {
     template_length:      i32,
     next_reference_id:    i32,
     next_reference_start: i64,
+    tags:                 Vec<([u8; 2], TagOwned)>,
 }
 
 impl BamRecord {
@@ -181,6 +339,7 @@ impl BamRecord {
             template_length:      d.template_length,
             next_reference_id:    d.next_reference_id,
             next_reference_start: d.next_reference_start,
+            tags:                 d.tags,
         }
     }
 }
@@ -209,17 +368,42 @@ impl BamRecord {
     // ── Python-typed getters ──────────────────────────────────────────────────
 
     /// Raw Phred quality scores as bytes, or None if absent.
-    /// Matches pysam.AlignedSegment.query_qualities semantics.
     #[getter]
     fn query_qualities<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        self.query_qualities.as_ref().map(|q| PyBytes::new(py, q))
+        self.query_qualities.as_ref().map(|q| PyBytes::new_bound(py, q))
     }
 
     /// List of (op_int, length) tuples in htslib BAM_C* encoding.
-    /// Matches pysam.AlignedSegment.cigartuples.
     #[getter]
     fn cigartuples(&self) -> Vec<(u32, u32)> {
         self.cigartuples.clone()
+    }
+
+    // ── tag accessors ─────────────────────────────────────────────────────────
+
+    /// Return the value of an auxiliary tag by its 2-character name.
+    /// Raises KeyError if the tag is absent, ValueError if the name is not 2 chars.
+    fn get_tag(&self, py: Python<'_>, tag: &str) -> PyResult<PyObject> {
+        let tag_bytes: [u8; 2] = tag.as_bytes()
+            .try_into()
+            .map_err(|_| PyValueError::new_err("tag name must be exactly 2 characters"))?;
+        for (t, v) in &self.tags {
+            if *t == tag_bytes {
+                return Ok(tag_owned_to_py(py, v));
+            }
+        }
+        Err(PyKeyError::new_err(format!("tag '{}' not found", tag)))
+    }
+
+    /// All auxiliary tags as a list of (name, value) tuples.
+    #[getter]
+    fn tags(&self, py: Python<'_>) -> Vec<(String, PyObject)> {
+        self.tags.iter()
+            .map(|(t, v)| {
+                let key = String::from_utf8_lossy(t).into_owned();
+                (key, tag_owned_to_py(py, v))
+            })
+            .collect()
     }
 
     // ── flag accessors ────────────────────────────────────────────────────────
@@ -241,7 +425,6 @@ impl BamRecord {
 
 #[pyclass]
 pub struct RecordIterator {
-    // Stored reversed so pop() yields records in genomic order (O(1) per record).
     records: Vec<RecordData>,
 }
 
@@ -275,9 +458,6 @@ pub struct AlignmentFile {
 
 #[pymethods]
 impl AlignmentFile {
-    /// Accepts the same positional/keyword arguments as pysam.AlignmentFile.
-    /// `mode` and `check_sq` are accepted for compatibility and ignored.
-    /// If `bai_path` is omitted, `<bam>.bai` is used.
     #[new]
     #[pyo3(signature = (filename, mode = "rb", check_sq = true, bai_path = None))]
     pub fn new(
@@ -288,36 +468,33 @@ impl AlignmentFile {
     ) -> PyResult<Self> {
         let _ = (mode, check_sq);
 
-        let reader = bam::IndexedReader::from_path(&filename).map_err(to_py_err)?;
-        let header = reader.header();
-        let nref = header.target_count();
-        let references: Vec<String> = (0..nref)
-            .map(|i| String::from_utf8_lossy(header.tid2name(i)).into_owned())
+        // Use noodles header reader — no rust-htslib dependency here.
+        let header = crate::get_bam_header(&filename).map_err(to_py_err)?;
+        let references: Vec<String> = header.reference_sequences().keys()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
             .collect();
-        let lengths: Vec<u64> = (0..nref)
-            .map(|i| header.target_len(i).unwrap_or(0))
+        let lengths: Vec<u64> = header.reference_sequences().values()
+            .map(|rs| rs.length().get() as u64)
             .collect();
 
         let bai = bai_path.unwrap_or_else(|| format!("{}.bai", filename));
-
         Ok(AlignmentFile { bam_path: filename, bai_path: bai, references, lengths })
     }
 
     #[getter] fn references(&self) -> Vec<String> { self.references.clone() }
     #[getter] fn lengths(&self)    -> Vec<u64>    { self.lengths.clone() }
 
-    /// Fast parallel count via noodles (no field parsing).
     #[pyo3(signature = (until_eof = false))]
     pub fn count(&self, until_eof: bool) -> PyResult<u64> {
         count(&self.bam_path, &self.bai_path, until_eof)
     }
 
-    /// Parallel record fetch using rust-htslib IndexedReader.
+    /// Parallel record fetch.
     ///
-    /// fetch()                   → all mapped records, parallel by chromosome
-    /// fetch(contig)             → one chromosome
-    /// fetch(contig, start, stop)→ region [start, stop) (0-based, half-open)
-    /// until_eof=True            → all records including unmapped (sequential)
+    /// fetch()                    → all mapped records via BAI intervals (noodles, tags included)
+    /// fetch(contig)              → one chromosome (rust-htslib, no tags)
+    /// fetch(contig, start, stop) → region [start, stop) (rust-htslib, no tags)
+    /// until_eof=True             → all records including unmapped, sequential (noodles, tags included)
     #[pyo3(signature = (contig = None, start = None, stop = None, until_eof = false))]
     pub fn fetch(
         &self,
@@ -327,27 +504,50 @@ impl AlignmentFile {
         until_eof: bool,
     ) -> PyResult<RecordIterator> {
         let bam_path = self.bam_path.clone();
+        let bai_path = self.bai_path.clone();
 
-        let records: Vec<RecordData> = if until_eof && contig.is_none() {
-            // Sequential scan of entire file including unmapped reads at EOF.
-            let mut reader = bam::Reader::from_path(&bam_path).map_err(to_py_err)?;
-            let mut recs = Vec::new();
-            let mut record = bam::Record::new();
-            while let Some(r) = reader.read(&mut record) {
-                r.map_err(to_py_err)?;
-                recs.push(RecordData::from_hts(&record));
-            }
-            recs
-        } else if let Some(ctg) = contig {
+        let records: Vec<RecordData> = if let Some(ctg) = contig {
+            // Region / chromosome fetch via rust-htslib (BAI bin-index lookup).
+            // Tags not available on this path.
             let s = start.unwrap_or(0);
             let e = stop.unwrap_or(i64::MAX);
-            fetch_region(&bam_path, ctg, s, e).map_err(to_py_err)?
+            if start.is_none() && stop.is_none() {
+                fetch_chromosome(&bam_path, ctg).map_err(to_py_err)?
+            } else {
+                fetch_region(&bam_path, ctg, s, e).map_err(to_py_err)?
+            }
+        } else if until_eof {
+            // Sequential noodles reader — includes unmapped reads at EOF.
+            let file = File::open(&bam_path).map_err(to_py_err)?;
+            let mut reader = noodles_bam::io::Reader::new(file);
+            let header = reader.read_header().map_err(to_py_err)?;
+            let mut recs = Vec::new();
+            for result in reader.records() {
+                let rec = result.map_err(to_py_err)?;
+                recs.push(RecordData::from_noodles(&rec, &header).map_err(to_py_err)?);
+            }
+            recs
         } else {
-            // Parallel fetch: one IndexedReader per chromosome per rayon worker.
-            let refs = self.references.clone();
-            refs.into_par_iter()
-                .map(|name| fetch_chromosome(&bam_path, &name))
-                .collect::<Result<Vec<Vec<RecordData>>, HtsError>>()
+            // Parallel fetch via BAI linear intervals + noodles BGZF reader.
+            // This is the high-performance path (same parallelism as count()).
+            let linear_indexes = get_linear_indexes(&bai_path).map_err(to_py_err)?;
+            let intervals = get_linear_intervals(&linear_indexes).map_err(to_py_err)?;
+            let all = get_entire_bam_intervals(&bam_path, &intervals).map_err(to_py_err)?;
+            let threads = rayon::current_num_threads().max(1);
+            let chunks = merge_intervals(&all, threads);
+            let header = crate::get_bam_header(&bam_path).map_err(to_py_err)?;
+
+            chunks
+                .into_par_iter()
+                .map(|(start_vp, end_vp)| -> io::Result<Vec<RecordData>> {
+                    let mut reader = read_bam_by_interval(&bam_path, start_vp, end_vp)?;
+                    let mut recs = Vec::new();
+                    for result in reader.records() {
+                        recs.push(RecordData::from_noodles(&result?, &header)?);
+                    }
+                    Ok(recs)
+                })
+                .collect::<io::Result<Vec<Vec<RecordData>>>>()
                 .map_err(to_py_err)?
                 .into_iter()
                 .flatten()
@@ -386,8 +586,6 @@ pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
-// Run with: cargo test --features python
-// Requires htslib at build time (available in Docker, not on Windows dev host).
 
 #[cfg(test)]
 mod tests {
@@ -396,8 +594,6 @@ mod tests {
     const TEST_BAM: &str = "tests/mt.sorted.bam";
     const CHR_M: &str = "chrM";
 
-    // rust-htslib sequential count must equal noodles sequential count.
-    // This verifies the underlying htslib read path against our reference counter.
     #[test]
     fn test_sequential_count_matches_noodles() -> Result<(), Box<dyn std::error::Error>> {
         let mut reader = bam::Reader::from_path(TEST_BAM)?;
@@ -415,13 +611,11 @@ mod tests {
         Ok(())
     }
 
-    // fetch_chromosome must return records and agree with a direct IndexedReader fetch on chrM.
     #[test]
     fn test_fetch_chrm_count_matches_sequential() -> Result<(), Box<dyn std::error::Error>> {
         let indexed = fetch_chromosome(TEST_BAM, CHR_M)?;
         assert!(!indexed.is_empty(), "expected records on {CHR_M}");
 
-        // Find chrM tid by scanning the header (tid() return type varies by htslib version).
         let mut reader = bam::IndexedReader::from_path(TEST_BAM)?;
         let header = reader.header().clone();
         let chrm_tid = (0..header.target_count())
@@ -443,7 +637,6 @@ mod tests {
         Ok(())
     }
 
-    // RecordData fields for mapped reads (flag 0x4 unset) must be internally consistent.
     #[test]
     fn test_mapped_record_fields_valid() -> Result<(), Box<dyn std::error::Error>> {
         let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
@@ -461,7 +654,6 @@ mod tests {
             for &(op, _) in &r.cigartuples {
                 assert!(op <= 9, "cigar op {op} out of BAM_C* range [0,9]");
             }
-            // Query-consuming ops (M=0,I=1,S=4,==7,X=8) must sum to sequence length.
             let qlen: u32 = r.cigartuples.iter()
                 .filter(|&&(op, _)| matches!(op, 0 | 1 | 4 | 7 | 8))
                 .map(|&(_, len)| len)
@@ -472,19 +664,16 @@ mod tests {
             );
             if let Some(q) = &r.query_qualities {
                 assert_eq!(q.len(), r.query_sequence.len(), "qual/seq length mismatch");
-                // Raw Phred (not +33): valid range [0, 93].
                 assert!(q.iter().all(|&v| v <= 93), "Phred score > 93");
             }
         }
         Ok(())
     }
 
-    // fetch_region must return a subset of fetch_chromosome and respect the coordinate bound.
-    // htslib returns reads OVERLAPPING [start, stop), so reference_start < stop must hold.
     #[test]
     fn test_fetch_region_subset_and_bounds() -> Result<(), Box<dyn std::error::Error>> {
-        let all   = fetch_chromosome(TEST_BAM, CHR_M)?;
-        let stop  = 2_000i64;
+        let all    = fetch_chromosome(TEST_BAM, CHR_M)?;
+        let stop   = 2_000i64;
         let region = fetch_region(TEST_BAM, CHR_M, 0, stop)?;
 
         assert!(
@@ -501,19 +690,16 @@ mod tests {
         Ok(())
     }
 
-    // is_forward and is_reverse are strict complements; BamRecord getters match flag bits.
     #[test]
     fn test_flag_getters_consistent() -> Result<(), Box<dyn std::error::Error>> {
         let recs = fetch_chromosome(TEST_BAM, CHR_M)?;
         assert!(!recs.is_empty());
         for d in &recs {
             let f = d.flag;
-            // is_forward and is_reverse must be strict complements.
             let is_rev = f & 0x010 != 0;
             let is_fwd = f & 0x010 == 0;
             assert_ne!(is_rev, is_fwd, "flag 0x{f:04x}: reverse and forward must differ");
 
-            // Verify BamRecord getters against direct bit arithmetic (catches mask typos).
             let r = BamRecord::from_data(RecordData {
                 query_name:           d.query_name.clone(),
                 flag:                 d.flag,
@@ -527,6 +713,7 @@ mod tests {
                 template_length:      d.template_length,
                 next_reference_id:    d.next_reference_id,
                 next_reference_start: d.next_reference_start,
+                tags:                 vec![],
             });
             assert_eq!(r.is_paired(),        f & 0x001 != 0, "is_paired mismatch");
             assert_eq!(r.is_unmapped(),      f & 0x004 != 0, "is_unmapped mismatch");
@@ -540,7 +727,6 @@ mod tests {
         Ok(())
     }
 
-    // Header must contain chrM with the correct reference length.
     #[test]
     fn test_header_chrm_length() -> Result<(), Box<dyn std::error::Error>> {
         let reader = bam::IndexedReader::from_path(TEST_BAM)?;
@@ -551,6 +737,88 @@ mod tests {
             .ok_or("chrM not found in header")?;
         let len = header.target_len(chrm_tid).ok_or("chrM has no length in header")?;
         assert_eq!(len, 16569, "chrM length should be 16569 bp");
+        Ok(())
+    }
+
+    // Noodles parallel fetch must return the same record count as the htslib sequential path.
+    #[test]
+    fn test_noodles_fetch_count_matches_htslib() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::bai_parser::{get_linear_indexes, get_linear_intervals};
+        use crate::bam_parser::{get_entire_bam_intervals, merge_intervals, read_bam_by_interval};
+
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let header = crate::get_bam_header(TEST_BAM)?;
+
+        let linear_indexes = get_linear_indexes(&bai_path)?;
+        let intervals = get_linear_intervals(&linear_indexes)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+        let chunks = merge_intervals(&all, rayon::current_num_threads().max(1));
+
+        let noodles_count: usize = chunks
+            .into_par_iter()
+            .map(|(start, end)| -> io::Result<usize> {
+                let mut reader = read_bam_by_interval(TEST_BAM, start, end)?;
+                let mut n = 0usize;
+                for result in reader.records() {
+                    RecordData::from_noodles(&result?, &header)?;
+                    n += 1;
+                }
+                Ok(n)
+            })
+            .collect::<io::Result<Vec<usize>>>()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+            .into_iter()
+            .sum();
+
+        let hts_count: usize = fetch_chromosome(TEST_BAM, CHR_M)?.len();
+
+        // noodles_count covers all chromosomes; hts_count is chrM only.
+        // Just verify noodles_count >= hts_count (chrM is a subset).
+        assert!(
+            noodles_count >= hts_count,
+            "noodles total {noodles_count} should be >= chrM htslib {hts_count}"
+        );
+
+        // Also verify against noodles standard reader.
+        let standard = crate::count_from_standard_bam_reader(TEST_BAM, 1)? as usize;
+        assert_eq!(
+            noodles_count, standard,
+            "noodles parallel fetch count {noodles_count} != standard reader {standard}"
+        );
+
+        Ok(())
+    }
+
+    // from_noodles must populate basic fields correctly for mapped reads.
+    #[test]
+    fn test_from_noodles_fields_valid() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::bai_parser::{get_linear_indexes, get_linear_intervals};
+        use crate::bam_parser::{get_entire_bam_intervals, merge_intervals, read_bam_by_interval};
+
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let header = crate::get_bam_header(TEST_BAM)?;
+
+        let linear_indexes = get_linear_indexes(&bai_path)?;
+        let intervals = get_linear_intervals(&linear_indexes)?;
+        let all = get_entire_bam_intervals(TEST_BAM, &intervals)?;
+        let chunks = merge_intervals(&all, 1);
+
+        let mut checked = 0u32;
+        'outer: for (start, end) in chunks {
+            let mut reader = read_bam_by_interval(TEST_BAM, start, end)?;
+            for result in reader.records() {
+                let rec = result?;
+                let d = RecordData::from_noodles(&rec, &header)?;
+                if d.flag & 0x004 != 0 { continue; } // skip unmapped
+                assert!(d.reference_id >= 0, "reference_id < 0 for mapped read");
+                assert!(d.reference_start >= 0, "reference_start < 0 for mapped read");
+                assert!(!d.query_sequence.is_empty(), "empty sequence");
+                assert!(!d.cigartuples.is_empty(), "empty cigar for mapped read");
+                checked += 1;
+                if checked >= 100 { break 'outer; }
+            }
+        }
+        assert!(checked > 0, "no mapped records checked");
         Ok(())
     }
 }

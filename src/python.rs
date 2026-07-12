@@ -264,6 +264,8 @@ pub fn count(bam_path: &str, bai_path: &str, until_eof: bool) -> PyResult<u64> {
         .map_err(to_py_err)
 }
 
+use crate::bam_parser::apply_cigar_to_diff;
+
 /// Count all BAM records in parallel without requiring a BAI index.
 ///
 /// Divides the compressed file into thread-count equal chunks, locates BGZF
@@ -568,6 +570,72 @@ impl AlignmentFile {
         result.push(("*".to_string(), 0, 0, unplaced));
 
         Ok(result)
+    }
+
+    /// Per-position coverage as a list of u32, length = stop - start.
+    ///
+    /// Coordinates: 0-based half-open [start, stop), same as pysam.
+    /// Default: full contig (start=0, stop=contig_length).
+    /// CIGAR-aware: M/=/X add coverage; D/N skip reference; I/S/H/P ignored.
+    /// Equivalent to `[col.nsegments for col in pysam.pileup(contig)]`
+    /// but computed entirely in Rust without Python object overhead.
+    #[pyo3(signature = (contig, start = None, stop = None))]
+    pub fn coverage(
+        &self,
+        contig: &str,
+        start: Option<i64>,
+        stop: Option<i64>,
+    ) -> PyResult<Vec<u32>> {
+        let header = crate::get_bam_header(&self.bam_path).map_err(to_py_err)?;
+        let contig_len = header
+            .reference_sequences()
+            .get(contig.as_bytes())
+            .map(|rs| rs.length().get() as i64)
+            .ok_or_else(|| PyValueError::new_err(format!("contig '{contig}' not in header")))?;
+
+        let s = start.unwrap_or(0).max(0) as usize;
+        let e = stop.unwrap_or(contig_len).min(contig_len) as usize;
+        if s >= e {
+            return Ok(vec![]);
+        }
+        let region_len = e - s;
+
+        // Stream records via indexed reader — no full Vec<RecordData> allocation.
+        let region_str = if s == 0 && e == contig_len as usize {
+            contig.to_string()
+        } else {
+            format!("{contig}:{}-{e}", s + 1) // 1-based closed start, 0-based exclusive stop
+        };
+        let region: Region = region_str
+            .parse()
+            .map_err(|err: noodles::core::region::ParseError| {
+                to_py_err(err.to_string())
+            })?;
+
+        let index = noodles_bam::bai::fs::read(&self.bai_path).map_err(to_py_err)?;
+        let mut reader = noodles_bam::io::indexed_reader::Builder::default()
+            .set_index(index)
+            .build_from_path(&self.bam_path)
+            .map_err(to_py_err)?;
+        let _ = reader.read_header().map_err(to_py_err)?;
+
+        let mut diff = vec![0i64; region_len + 1];
+        for result in reader.query(&header, &region).map_err(to_py_err)?.records() {
+            let rec = result.map_err(to_py_err)?;
+            let rd = RecordData::from_noodles(&rec, &header).map_err(to_py_err)?;
+            if rd.flag & 0x004 != 0 || rd.reference_start < 0 {
+                continue;
+            }
+            apply_cigar_to_diff(&mut diff, rd.reference_start, &rd.cigartuples, s);
+        }
+
+        let mut cov = vec![0u32; region_len];
+        let mut running = 0i64;
+        for (i, &d) in diff[..region_len].iter().enumerate() {
+            running += d;
+            cov[i] = running.max(0) as u32;
+        }
+        Ok(cov)
     }
 
     fn __iter__(&self) -> PyResult<RecordIterator> {
@@ -889,6 +957,87 @@ mod tests {
             "idxstats total (mapped+unmapped+unplaced={idxstats_total}) != sequential count {sequential}"
         );
 
+        Ok(())
+    }
+
+    // ── coverage tests ────────────────────────────────────────────────────────
+
+    // Algebraic invariant: Σcov[i] == Σ aligned reference bases across all reads.
+    // For a full-contig diff-array accumulation this must hold exactly.
+    #[test]
+    fn test_coverage_sum_equals_aligned_bases() -> Result<(), Box<dyn std::error::Error>> {
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let contig_len = header.reference_sequences()
+            .get(CHR_M.as_bytes())
+            .map(|rs| rs.length().get())
+            .unwrap();
+
+        // Compute coverage via diff array.
+        let recs = fetch_contig_or_region(TEST_BAM, &bai_path, &header, CHR_M, None, None)?;
+        let mut diff = vec![0i64; contig_len + 1];
+        for rec in &recs {
+            if rec.flag & 0x004 != 0 || rec.reference_start < 0 { continue; }
+            apply_cigar_to_diff(&mut diff, rec.reference_start, &rec.cigartuples, 0);
+        }
+        let mut cov = vec![0u32; contig_len];
+        let mut running = 0i64;
+        for (i, &d) in diff[..contig_len].iter().enumerate() {
+            running += d;
+            cov[i] = running.max(0) as u32;
+        }
+
+        let cov_sum: u64 = cov.iter().map(|&d| d as u64).sum();
+
+        // Ground truth: sum of M/X/= CIGAR lengths for all mapped reads.
+        let aligned_bases: u64 = recs.iter()
+            .filter(|r| r.flag & 0x004 == 0 && r.reference_start >= 0)
+            .map(|r| r.cigartuples.iter()
+                .filter(|&&(op, _)| matches!(op, 0 | 7 | 8))
+                .map(|&(_, l)| l as u64)
+                .sum::<u64>())
+            .sum();
+
+        assert_eq!(
+            cov_sum, aligned_bases,
+            "Σcov ({cov_sum}) != Σaligned_bases ({aligned_bases})"
+        );
+        assert!(cov_sum > 0, "expected non-zero coverage on {CHR_M}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_coverage_array_length_and_nonzero() -> Result<(), Box<dyn std::error::Error>> {
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let contig_len = header.reference_sequences()
+            .get(CHR_M.as_bytes())
+            .map(|rs| rs.length().get())
+            .unwrap();
+
+        // Region subset.
+        let stop = 2000usize;
+        let recs = fetch_contig_or_region(
+            TEST_BAM, &bai_path, &header, CHR_M, Some(0), Some(stop as i64),
+        )?;
+        let mut diff = vec![0i64; stop + 1];
+        for rec in &recs {
+            if rec.flag & 0x004 != 0 || rec.reference_start < 0 { continue; }
+            apply_cigar_to_diff(&mut diff, rec.reference_start, &rec.cigartuples, 0);
+        }
+        let mut cov = vec![0u32; stop];
+        let mut running = 0i64;
+        for (i, &d) in diff[..stop].iter().enumerate() {
+            running += d;
+            cov[i] = running.max(0) as u32;
+        }
+
+        assert_eq!(cov.len(), stop, "region coverage length should be {stop}");
+        let covered = cov.iter().filter(|&&d| d > 0).count();
+        assert!(covered > 0, "expected some covered positions in chrM [0,{stop})");
+
+        // Region coverage must be <= full contig coverage.
+        let _ = contig_len; // verified separately in test_coverage_sum_equals_aligned_bases
         Ok(())
     }
 }

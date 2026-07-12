@@ -307,6 +307,40 @@ pub fn find_parallel_chunks_no_index(
     Ok(intervals)
 }
 
+/// CIGAR-aware coverage accumulation into a diff array.
+///
+/// `diff` has length `region_len + 1`; index 0 maps to `region_start` (0-based).
+/// M/=/X (ops 0/7/8) consume the reference and are counted as covered.
+/// D/N (ops 2/3) skip reference positions — no coverage added.
+/// I/S/H/P do not advance ref_pos.
+pub(crate) fn apply_cigar_to_diff(
+    diff: &mut [i64],
+    ref_start: i64,
+    cigartuples: &[(u32, u32)],
+    region_start: usize,
+) {
+    let region_end = region_start + diff.len(); // exclusive upper bound
+    let mut ref_pos = ref_start;
+    for &(op, len) in cigartuples {
+        let len = len as i64;
+        match op {
+            0 | 7 | 8 => {
+                let s = ref_pos.max(region_start as i64);
+                let e = (ref_pos + len).min(region_end as i64);
+                if s < e {
+                    let si = (s - region_start as i64) as usize;
+                    let ei = (e - region_start as i64) as usize;
+                    diff[si] += 1;
+                    diff[ei] -= 1;
+                }
+                ref_pos += len;
+            }
+            2 | 3 => { ref_pos += len; }
+            _ => {}
+        }
+    }
+}
+
 // ── Step 14 building blocks: no-index parallel reading ────────────────────────
 
 /// Scan `data` (raw compressed file bytes) for the next valid BGZF block
@@ -569,6 +603,111 @@ mod test {
             count_no_idx, sequential,
             "no-index parallel count {count_no_idx} != sequential {sequential}"
         );
+        Ok(())
+    }
+
+    // ── coverage: apply_cigar_to_diff ─────────────────────────────────────────
+
+    // Simple read: "100M" starting at pos 0 → coverage[0..100] = 1, rest = 0.
+    #[test]
+    fn test_apply_cigar_100m_full_coverage() {
+        let mut diff = vec![0i64; 201]; // region [0, 200), +1 sentinel
+        apply_cigar_to_diff(&mut diff, 0, &[(0, 100)], 0);
+        let mut cov = vec![0u32; 200];
+        let mut run = 0i64;
+        for (i, &d) in diff[..200].iter().enumerate() {
+            run += d;
+            cov[i] = run.max(0) as u32;
+        }
+        assert!(cov[..100].iter().all(|&d| d == 1), "positions 0..100 must be covered");
+        assert!(cov[100..].iter().all(|&d| d == 0), "positions 100..200 must be 0");
+    }
+
+    // "50M2D50M" — deletion is NOT counted as covered.
+    #[test]
+    fn test_apply_cigar_deletion_skipped() {
+        let mut diff = vec![0i64; 153]; // region [0, 152), +1 sentinel
+        apply_cigar_to_diff(&mut diff, 0, &[(0, 50), (2, 2), (0, 50)], 0);
+        let mut cov = vec![0u32; 152];
+        let mut run = 0i64;
+        for (i, &d) in diff[..152].iter().enumerate() {
+            run += d;
+            cov[i] = run.max(0) as u32;
+        }
+        assert!(cov[..50].iter().all(|&d| d == 1),   "positions 0..50 must be covered");
+        assert!(cov[50..52].iter().all(|&d| d == 0),  "deletion 50..52 must NOT be covered");
+        assert!(cov[52..102].iter().all(|&d| d == 1), "positions 52..102 must be covered");
+        assert!(cov[102..].iter().all(|&d| d == 0),   "tail must be 0");
+    }
+
+    // Reads with real BAM: Σcov == Σ(M/X/= bases) for all mapped reads on chrM.
+    #[test]
+    fn test_coverage_sum_equals_aligned_bases() -> Result<(), Box<dyn std::error::Error>> {
+        use noodles::bam as nb;
+        use noodles::core::Region;
+        use noodles::sam::alignment::RecordBuf;
+        use noodles::sam::alignment::record::Cigar as CigarTrait;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let contig_len = header
+            .reference_sequences()
+            .get(b"chrM".as_ref())
+            .map(|rs| rs.length().get())
+            .unwrap();
+
+        let region: Region = "chrM".parse().unwrap();
+        let index = nb::bai::fs::read(TEST_BAI)?;
+        let mut reader = nb::io::indexed_reader::Builder::default()
+            .set_index(index)
+            .build_from_path(TEST_BAM)?;
+        let _ = reader.read_header()?;
+
+        let mut diff = vec![0i64; contig_len + 1];
+        let mut aligned_bases: u64 = 0;
+
+        for result in reader.query(&header, &region)?.records() {
+            let rec = result?;
+            let buf = RecordBuf::try_from_alignment_record(&header, &rec)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if buf.flags().is_unmapped() { continue; }
+            let ref_start = match buf.alignment_start() {
+                Some(pos) => usize::from(pos) as i64 - 1,
+                None => continue,
+            };
+            let tuples: Vec<(u32, u32)> = buf.cigar().iter()
+                .filter_map(|r| r.ok())
+                .map(|op| {
+                    let code = match op.kind() {
+                        Kind::Match            => 0,
+                        Kind::Insertion        => 1,
+                        Kind::Deletion         => 2,
+                        Kind::Skip             => 3,
+                        Kind::SoftClip         => 4,
+                        Kind::HardClip         => 5,
+                        Kind::Pad              => 6,
+                        Kind::SequenceMatch    => 7,
+                        Kind::SequenceMismatch => 8,
+                    };
+                    (code, op.len() as u32)
+                })
+                .collect();
+            aligned_bases += tuples.iter()
+                .filter(|&&(op, _)| matches!(op, 0 | 7 | 8))
+                .map(|&(_, l)| l as u64)
+                .sum::<u64>();
+            apply_cigar_to_diff(&mut diff, ref_start, &tuples, 0);
+        }
+
+        let cov_sum: u64 = {
+            let mut run = 0i64;
+            (0..contig_len).map(|i| { run += diff[i]; run.max(0) as u64 }).sum()
+        };
+        assert_eq!(
+            cov_sum, aligned_bases,
+            "Σcov ({cov_sum}) != Σaligned_bases ({aligned_bases})"
+        );
+        assert!(cov_sum > 0, "expected non-zero coverage on chrM");
         Ok(())
     }
 

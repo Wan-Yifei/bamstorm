@@ -14,12 +14,25 @@ ECR_IMAGE_URI="__ECR_IMAGE_URI__"
 CONTIG="__CONTIG__"
 TIMEOUT="__TIMEOUT__"
 
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
 echo "=== Bamstorm Coverage Benchmark ==="
-echo "Instance : $(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+echo "Instance : $(curl -s http://169.254.169.254/latest/meta-data/instance-type)  ($INSTANCE_ID)"
 echo "CPUs     : $(nproc)"
 echo "RAM      : $(free -h | awk '/^Mem/{print $2}')"
 echo "Image    : $ECR_IMAGE_URI"
 echo "Contig   : $CONTIG  (pysam timeout: ${TIMEOUT}s)"
+echo ""
+
+# Hard lifetime limit: self-terminate after 90 min regardless of benchmark
+# outcome.  Prevents runaway billing if Docker hangs or the script crashes
+# before reaching the shutdown at the bottom.
+MAX_LIFETIME=5400   # 90 minutes
+(sleep $MAX_LIFETIME \
+ && echo "WATCHDOG: ${MAX_LIFETIME}s elapsed, force-terminating" \
+ && aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID") &
+WATCHDOG_PID=$!
+echo "Watchdog PID ${WATCHDOG_PID} (hard limit: ${MAX_LIFETIME}s)"
 echo ""
 
 # -- find + mount local NVMe instance store ----------------------------------

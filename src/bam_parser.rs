@@ -205,6 +205,96 @@ pub fn get_entire_bam_reader(
     Ok(all_interval_readers)
 }
 
+// ── Step 14 building blocks: no-index parallel reading ────────────────────────
+
+/// Scan `data` (raw compressed file bytes) for the next valid BGZF block
+/// starting at or after `from`. Checks four non-contiguous magic bytes in the
+/// 18-byte BGZF header as described in QuickBAM SuppMethods:
+///   byte  0 = 0x1f, byte  1 = 0x8b  (gzip magic)
+///   byte 12 = 0x42 ('B'), byte 13 = 0x43 ('C')  (BGZF subfield ID)
+/// Returns the compressed offset of the match, or None.
+pub fn find_next_bgzf_block(data: &[u8], from: usize) -> Option<usize> {
+    let len = data.len();
+    let mut i = from;
+    while i + 14 <= len {
+        if data[i] == 0x1f
+            && data[i + 1]  == 0x8b
+            && data[i + 12] == 0x42
+            && data[i + 13] == 0x43
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns whether the bytes at `offset` in a decompressed BAM stream look
+/// like a valid BAM record start, using the QuickBAM heuristic criteria
+/// (SuppMethods.docx):
+///   -1 ≤ ref_id < n_ref
+///   ref_id == -1 → pos == -1;  else 0 ≤ pos < ref_lens[ref_id]
+///   same constraints for next_ref_id / next_pos
+///   read_name[l_read_name - 1] == 0  (null-terminated)
+///
+/// BAM record layout at `offset` (all LE):
+///   [0..4]   block_size  u32   (does NOT include itself)
+///   [4..8]   ref_id      i32
+///   [8..12]  pos         i32   (0-based; -1 for unmapped)
+///   [12]     l_read_name u8    (includes NUL terminator)
+///   [13]     mapq        u8
+///   [14..16] bin         u16
+///   [16..18] n_cigar_op  u16
+///   [18..20] flag        u16
+///   [20..24] l_seq       i32
+///   [24..28] next_ref    i32
+///   [28..32] next_pos    i32
+///   [32..36] tlen        i32
+///   [36..]   read_name (l_read_name bytes, NUL-terminated)
+pub fn is_valid_bam_record_start(
+    data: &[u8],
+    offset: usize,
+    n_ref: usize,
+    ref_lens: &[u32],
+) -> bool {
+    if offset + 36 > data.len() {
+        return false;
+    }
+    let d = &data[offset..];
+
+    let ref_id      = i32::from_le_bytes(d[4..8].try_into().unwrap());
+    let pos         = i32::from_le_bytes(d[8..12].try_into().unwrap());
+    let l_read_name = d[12] as usize;
+    let next_ref    = i32::from_le_bytes(d[24..28].try_into().unwrap());
+    let next_pos    = i32::from_le_bytes(d[28..32].try_into().unwrap());
+
+    // ref_id bounds
+    if ref_id < -1 || (ref_id >= 0 && ref_id as usize >= n_ref) {
+        return false;
+    }
+    // pos: unmapped sentinel is -1; mapped reads must be in range
+    if ref_id == -1 {
+        if pos != -1 { return false; }
+    } else if pos < 0 || pos as u32 >= ref_lens[ref_id as usize] {
+        return false;
+    }
+    // next_ref bounds
+    if next_ref < -1 || (next_ref >= 0 && next_ref as usize >= n_ref) {
+        return false;
+    }
+    // next_pos: same rules
+    if next_ref == -1 {
+        if next_pos != -1 { return false; }
+    } else if next_pos < 0 || next_pos as u32 >= ref_lens[next_ref as usize] {
+        return false;
+    }
+    // read_name must be non-empty and null-terminated
+    if l_read_name == 0 || offset + 36 + l_read_name > data.len() {
+        return false;
+    }
+    data[offset + 36 + l_read_name - 1] == 0
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -346,6 +436,90 @@ mod test {
             merged_count, standard_count,
             "merged intervals count must match standard reader"
         );
+        Ok(())
+    }
+
+    // ── Step 14 sanity checks ─────────────────────────────────────────────────
+
+    // Verify find_next_bgzf_block can traverse the entire file by jumping each
+    // block via its BSIZE field — a full chain walk proves the scanner finds
+    // real block boundaries, not false positives.
+    #[test]
+    fn test_bgzf_scan_covers_whole_file() -> Result<(), Box<dyn std::error::Error>> {
+        let compressed = std::fs::read(TEST_BAM)?;
+        let file_size  = compressed.len();
+
+        let mut i     = 0usize;
+        let mut count = 0usize;
+        while i < file_size {
+            let pos = find_next_bgzf_block(&compressed, i)
+                .ok_or("no BGZF block found")?;
+            assert_eq!(pos, i, "scanner jumped past a block at offset {i}");
+            // BSIZE field is at bytes [16..18] of the header (LE u16).
+            let bsize = u16::from_le_bytes([compressed[pos + 16], compressed[pos + 17]]) as usize + 1;
+            i = pos + bsize;
+            count += 1;
+        }
+        assert!(count > 5, "expected >5 BGZF blocks, got {count}");
+        Ok(())
+    }
+
+    // Verify is_valid_bam_record_start accepts all known-good record starts
+    // and has a negligible false-positive rate at non-record offsets.
+    #[test]
+    fn test_heuristic_accepts_real_records() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Read;
+
+        // Decompress the whole BAM to raw bytes.
+        let file = File::open(TEST_BAM)?;
+        let mut bgzf = noodles::bgzf::io::Reader::new(file);
+        let mut raw = Vec::new();
+        bgzf.read_to_end(&mut raw)?;
+
+        // Parse BAM header to find where records start and get ref info.
+        let header = crate::get_bam_header(TEST_BAM)?;
+        let n_ref: usize = header.reference_sequences().len();
+        let ref_lens: Vec<u32> = header.reference_sequences().values()
+            .map(|rs| rs.length().get() as u32)
+            .collect();
+
+        // Walk the raw BAM header manually to find byte offset of first record.
+        // Layout: magic(4) + l_text(4) + text(l_text) + n_ref(4) + [l_name(4)+name+l_ref(4)]×n
+        let mut off = 4usize; // skip "BAM\1"
+        let l_text = u32::from_le_bytes(raw[off..off+4].try_into()?) as usize;
+        off += 4 + l_text;
+        let n_ref_hdr = u32::from_le_bytes(raw[off..off+4].try_into()?) as usize;
+        off += 4;
+        for _ in 0..n_ref_hdr {
+            let l_name = u32::from_le_bytes(raw[off..off+4].try_into()?) as usize;
+            off += 4 + l_name + 4;
+        }
+        // `off` now points to the first BAM record.
+
+        // 1. Every known-good record start must pass the heuristic.
+        let mut rec_off = off;
+        let mut checked = 0usize;
+        while checked < 20 && rec_off + 4 <= raw.len() {
+            assert!(
+                is_valid_bam_record_start(&raw, rec_off, n_ref, &ref_lens),
+                "heuristic rejected known-good record at decompressed offset {rec_off}"
+            );
+            let block_size = u32::from_le_bytes(raw[rec_off..rec_off+4].try_into()?) as usize;
+            rec_off += 4 + block_size;
+            checked += 1;
+        }
+        assert!(checked > 0, "no records checked");
+
+        // 2. False-positive rate at non-record positions should be very low.
+        let window = (off + 1)..(off + 200).min(raw.len());
+        let false_positives = window
+            .filter(|&p| is_valid_bam_record_start(&raw, p, n_ref, &ref_lens))
+            .count();
+        assert!(
+            false_positives < 3,
+            "too many false positives in first record body: {false_positives}"
+        );
+
         Ok(())
     }
 

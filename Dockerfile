@@ -1,17 +1,24 @@
-# Stage 1: build bamstrom binaries
+# Stage 1: build bamstorm binaries + Python extension wheel
 FROM rust:slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libhts-dev \
     libclang-dev \
+    python3 \
+    python3-dev \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pip3 install maturin --break-system-packages
+
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock pyproject.toml ./
 COPY src ./src
+COPY python ./python
 
 RUN cargo build --release --bin bench_count
+RUN maturin build --release --out /tmp/wheels
 
 # Stage 2: build RabbitBAM and its dependencies (htslib + libdeflate) from source
 FROM debian:bookworm-slim AS rabbitbam-builder
@@ -65,6 +72,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     samtools \
     python3 \
+    python3-pip \
     python3-pysam \
     fio \
     zlib1g \
@@ -76,8 +84,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# bamstrom counter
+# bamstorm CLI counter
 COPY --from=builder /build/target/release/bench_count /app/bench_count
+
+# bamstorm Python extension wheel
+COPY --from=builder /tmp/wheels /tmp/wheels
+RUN pip3 install /tmp/wheels/bamstorm-*.whl --break-system-packages \
+    && rm -rf /tmp/wheels
 
 # RabbitBAM binary + all build artifacts (binary links against tools.o and .so files)
 COPY --from=rabbitbam-builder /opt/RabbitBAM /opt/RabbitBAM

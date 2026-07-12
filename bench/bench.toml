@@ -26,6 +26,16 @@ numjobs_parallel = 0
 # Directory for the fio temp file. Defaults to the BAM file's directory.
 # tmpdir = "/tmp"
 
+[coverage]
+# Set to true to run the CIGAR-aware coverage benchmark (bamstorm vs pysam pileup).
+enabled = true
+# Contig name. Use a high-depth contig (e.g. chrM) to amplify pysam pileup overhead.
+contig = "chrM"
+# Optional 0-based half-open region within the contig.
+# If omitted, the full contig is scanned.
+# start = 0
+# stop  = 16569
+
 # Per-tool overrides — uncomment to diverge from benchmark.threads.
 # [bamstorm]
 # threads = [2, 4, 8, 16, 32, 64, 128]

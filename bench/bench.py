@@ -36,6 +36,12 @@ try:
 except ImportError:
     HAS_PYSAM = False
 
+try:
+    import bamstorm as _bamstorm_probe  # noqa: F401
+    HAS_BAMSTORM = True
+except ImportError:
+    HAS_BAMSTORM = False
+
 BENCH_COUNT_BIN  = "/app/bench_count"
 RABBITBAM_BIN    = "/opt/RabbitBAM/rabbitbam"
 DEFAULT_CONFIG   = Path(__file__).parent / "bench.toml"
@@ -191,6 +197,35 @@ def run_pysam(bam: str, threads: int) -> tuple[float, int]:
     return time.perf_counter() - t0, n
 
 
+def run_bamstorm_coverage(
+    bam: str, bai: str, contig: str,
+    start: int | None = None,
+    stop: int | None = None,
+) -> tuple[float, int]:
+    """Return (elapsed, total_coverage_bases) via Rust diff-array accumulation."""
+    import bamstorm
+    t0 = time.perf_counter()
+    af = bamstorm.AlignmentFile(bam, "rb", bai_path=bai)
+    cov = af.coverage(contig, start, stop)
+    total = sum(cov)
+    return time.perf_counter() - t0, total
+
+
+def run_pysam_pileup(
+    bam: str, contig: str,
+    start: int | None = None,
+    stop: int | None = None,
+) -> tuple[float, int]:
+    """Return (elapsed, total_coverage_bases) via pysam PileupColumn objects."""
+    t0 = time.perf_counter()
+    with pysam.AlignmentFile(bam, "rb") as f:
+        if start is not None and stop is not None:
+            total = sum(col.nsegments for col in f.pileup(contig, start, stop))
+        else:
+            total = sum(col.nsegments for col in f.pileup(contig))
+    return time.perf_counter() - t0, total
+
+
 def drop_caches(bam: str, bai: str) -> None:
     """Evict bam/bai pages from the OS page cache for a true cold-cache read.
 
@@ -312,6 +347,18 @@ def main() -> None:
                    else cfg.get("benchmark", {}).get("drop_cache", True)
     warm_repeats = args.warm_repeats if args.warm_repeats is not None \
                    else cfg.get("benchmark", {}).get("warm_repeats", 0)
+
+    # Coverage benchmark config
+    cov_cfg     = cfg.get("coverage", {})
+    cov_enabled = cov_cfg.get("enabled", False)
+    cov_contig  = cov_cfg.get("contig", "chrM")
+    cov_start   = cov_cfg.get("start", None)
+    cov_stop    = cov_cfg.get("stop", None)
+    cov_region  = (
+        f"{cov_contig}:{cov_start}-{cov_stop}"
+        if cov_start is not None and cov_stop is not None
+        else cov_contig
+    )
 
     # Per-tool BAM/BAI: fall back to the primary bam/bai if not specified.
     # Tool assignment: bamstorm=bam1, samtools=bam2, rabbitbam=bam3, pysam=bam4
@@ -442,6 +489,37 @@ def main() -> None:
     else:
         print("  pysam not installed — skipped")
 
+    # ── coverage benchmark (Rust diff-array vs pysam pileup) ─────────────────
+    if cov_enabled:
+        print()
+        print(f"  [coverage: {cov_region}]")
+
+        if HAS_BAMSTORM:
+            try:
+                runs = run_repeats(bam1, bai1,
+                                   run_bamstorm_coverage, bam1, bai1,
+                                   cov_contig, cov_start, cov_stop)
+                r = record_ok("bamstorm coverage", 1, runs)
+            except Exception as e:
+                r = record_err("bamstorm coverage", 1, str(e))
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+        else:
+            print("  bamstorm not installed — skipped")
+
+        if HAS_PYSAM:
+            try:
+                runs = run_repeats(bam1, bai1,
+                                   run_pysam_pileup, bam1,
+                                   cov_contig, cov_start, cov_stop)
+                r = record_ok("pysam pileup", 1, runs)
+            except Exception as e:
+                r = record_err("pysam pileup", 1, str(e))
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+        else:
+            print("  pysam not installed — skipped")
+
     # ── warm-cache runs ────────────────────────────────────────────────────────
     if warm_repeats > 0:
         print()
@@ -489,6 +567,30 @@ def main() -> None:
                     r = record_ok("pysam fetch(until_eof)", t, runs, cache="warm")
                 except Exception as e:
                     r = record_err("pysam fetch(until_eof)", t, str(e), cache="warm")
+                print(fmt_row(r, bam_mb))
+                results.append(r)
+
+        if cov_enabled:
+            print()
+            print(f"  [coverage: {cov_region}]  [warm]")
+
+            if HAS_BAMSTORM:
+                try:
+                    runs = [run_bamstorm_coverage(bam1, bai1, cov_contig, cov_start, cov_stop)
+                            for _ in range(warm_repeats)]
+                    r = record_ok("bamstorm coverage", 1, runs, cache="warm")
+                except Exception as e:
+                    r = record_err("bamstorm coverage", 1, str(e), cache="warm")
+                print(fmt_row(r, bam_mb))
+                results.append(r)
+
+            if HAS_PYSAM:
+                try:
+                    runs = [run_pysam_pileup(bam1, cov_contig, cov_start, cov_stop)
+                            for _ in range(warm_repeats)]
+                    r = record_ok("pysam pileup", 1, runs, cache="warm")
+                except Exception as e:
+                    r = record_err("pysam pileup", 1, str(e), cache="warm")
                 print(fmt_row(r, bam_mb))
                 results.append(r)
 

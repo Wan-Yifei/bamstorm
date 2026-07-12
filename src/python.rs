@@ -511,6 +511,33 @@ impl AlignmentFile {
         Ok(RecordIterator::new(records))
     }
 
+    /// Returns per-reference mapping statistics read directly from the BAI index.
+    /// Output: list of (name, length, n_mapped, n_unmapped).
+    /// Last entry is ("*", 0, 0, unplaced_unmapped) — reads with no reference.
+    /// Equivalent to `samtools idxstats`, O(1) — does not read the BAM file.
+    pub fn idxstats(&self) -> PyResult<Vec<(String, u64, u64, u64)>> {
+        use noodles::csi::BinningIndex;
+        use noodles::csi::binning_index::ReferenceSequence as _;
+
+        let index = noodles_bam::bai::fs::read(&self.bai_path).map_err(to_py_err)?;
+
+        let mut result: Vec<(String, u64, u64, u64)> = self.references.iter()
+            .zip(self.lengths.iter())
+            .zip(index.reference_sequences())
+            .map(|((name, &len), ref_seq)| {
+                let (n_mapped, n_unmapped) = ref_seq.metadata()
+                    .map(|m| (m.mapped_record_count(), m.unmapped_record_count()))
+                    .unwrap_or((0, 0));
+                (name.clone(), len, n_mapped, n_unmapped)
+            })
+            .collect();
+
+        let unplaced = index.unplaced_unmapped_record_count().unwrap_or(0);
+        result.push(("*".to_string(), 0, 0, unplaced));
+
+        Ok(result)
+    }
+
     fn __iter__(&self) -> PyResult<RecordIterator> {
         self.fetch(None, None, None, false)
     }
@@ -787,6 +814,48 @@ mod tests {
             }
         }
         assert!(checked > 0, "no mapped records checked");
+        Ok(())
+    }
+
+    #[test]
+    fn test_idxstats_basic() -> Result<(), Box<dyn std::error::Error>> {
+        use noodles::csi::BinningIndex;
+        use noodles::csi::binning_index::ReferenceSequence as _;
+
+        let bai_path = format!("{}.bai", TEST_BAM);
+        let index = noodles_bam::bai::fs::read(&bai_path)?;
+        let header = crate::get_bam_header(TEST_BAM)?;
+
+        // Collect idxstats directly via the index API.
+        let stats: Vec<(String, u64, u64, u64)> = header.reference_sequences().keys()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .zip(header.reference_sequences().values().map(|v| v.length().get() as u64))
+            .zip(index.reference_sequences())
+            .map(|((name, len), ref_seq)| {
+                let (n_mapped, n_unmapped) = ref_seq.metadata()
+                    .map(|m| (m.mapped_record_count(), m.unmapped_record_count()))
+                    .unwrap_or((0, 0));
+                (name, len, n_mapped, n_unmapped)
+            })
+            .collect();
+
+        // chrM must be present with non-zero mapped count.
+        let chrm = stats.iter().find(|(name, _, _, _)| name == CHR_M)
+            .ok_or("chrM not found in idxstats")?;
+        assert!(chrm.2 > 0, "chrM n_mapped should be > 0");
+        assert_eq!(chrm.1, 16569, "chrM length should be 16569");
+
+        // BAI invariant: n_mapped + n_unmapped_per_ref + unplaced = total records.
+        let total_mapped:   u64 = stats.iter().map(|(_, _, m, _)| m).sum();
+        let total_unmapped: u64 = stats.iter().map(|(_, _, _, u)| u).sum();
+        let unplaced = index.unplaced_unmapped_record_count().unwrap_or(0);
+        let idxstats_total = total_mapped + total_unmapped + unplaced;
+        let sequential = crate::count_from_standard_bam_reader(TEST_BAM, 1)?;
+        assert_eq!(
+            idxstats_total, sequential,
+            "idxstats total (mapped+unmapped+unplaced={idxstats_total}) != sequential count {sequential}"
+        );
+
         Ok(())
     }
 }

@@ -170,6 +170,33 @@ def main() -> None:
         has_pysam = False
         print("[warn] pysam not installed — pysam runs skipped")
 
+    # Validate contig exists and has mapped reads (fast BAI check).
+    if has_bamstorm:
+        import bamstorm as _bs
+        _af = _bs.AlignmentFile(args.bam, "rb", bai_path=args.bai)
+        _stats = _af.idxstats()  # list of (contig, length, mapped, unmapped)
+        _mapped_by_name = {name: mapped for name, _len, mapped, _unmapped in _stats}
+        _mapped_count = _mapped_by_name.get(args.contig, -1)
+        if _mapped_count == 0:
+            available = [name for name, _, m, _ in _stats if m > 0]
+            print(
+                f"ERROR: contig '{args.contig}' has 0 mapped reads in this BAM.\n"
+                f"  Contigs with mapped reads: {', '.join(available)}\n"
+                f"  Re-run with e.g.: --contig {available[0] if available else '?'}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif _mapped_count == -1:
+            available = [name for name, _, m, _ in _stats if m > 0]
+            print(
+                f"ERROR: contig '{args.contig}' not found in BAI index.\n"
+                f"  Available contigs (with reads): {', '.join(available)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"  Contig validation: '{args.contig}' has {_mapped_count:,} mapped reads. OK")
+        del _af, _bs, _stats, _mapped_by_name, _mapped_count
+
     # Collects all individual (elapsed, total_cov) tuples per tool.
     all_rows: list[dict] = []
 

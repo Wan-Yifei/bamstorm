@@ -17,8 +17,8 @@ S3_BAM_KEY="test_15gb.bam"
 S3_BAI_KEY="test_15gb.bam.bai"
 S3_RESULTS_PREFIX="bamstorm-coverage-results"
 INSTANCE_PROFILE="bamstorm-bench-ec2-profile"
-CONTIG="chr22"
-TIMEOUT=600
+CONTIG="chr4"
+TIMEOUT=3600
 
 usage() {
     cat <<EOF
@@ -26,8 +26,8 @@ Usage: $0 -i <ecr-image-uri> [OPTIONS]
 
   -i URI        ECR image URI (required; printed by cfn-deploy.sh)
   -t TYPE       Instance type, must have local NVMe (default: i4i.4xlarge)
-  -c CONTIG     Contig/chromosome name (default: chr22)
-  -T SECONDS    pysam pileup hard timeout per run (default: 600)
+  -c CONTIG     Contig/chromosome name (default: chr4)
+  -T SECONDS    pysam pileup hard timeout per run (default: 3600)
   -p PROFILE    AWS CLI profile (default: admin)
   -r REGION     AWS region (default: us-east-1)
   -h            Show this help

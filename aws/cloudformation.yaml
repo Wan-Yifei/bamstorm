@@ -53,7 +53,9 @@ Resources:
                 Effect: Allow
                 Action:
                   - s3:PutObject
-                Resource: !Sub arn:aws:s3:::${S3BucketName}/bamstorm-bench-results/*
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}/bamstorm-bench-results/*
+                  - !Sub arn:aws:s3:::${S3BucketName}/bamstorm-coverage-results/*
               - Sid: S3ListBucket
                 Effect: Allow
                 Action:

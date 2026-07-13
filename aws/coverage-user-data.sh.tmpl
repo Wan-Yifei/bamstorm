@@ -2,7 +2,10 @@
 # EC2 user-data for the bamstorm vs pysam coverage benchmark.
 # Templated by launch_coverage.sh -- placeholders substituted with sed.
 # ASCII only (Windows file:// encoding constraint).
-set -euo pipefail
+# Note: intentionally NOT using set -e so that a failed S3 upload does not
+# prevent the shutdown at the end.  Individual critical steps still exit
+# explicitly with `|| { ...; exit 1; }`.
+set -uo pipefail
 exec > >(tee /var/log/bamstorm-bench.log) 2>&1
 
 REGION="__REGION__"
@@ -24,10 +27,10 @@ echo "Image    : $ECR_IMAGE_URI"
 echo "Contig   : $CONTIG  (pysam timeout: ${TIMEOUT}s)"
 echo ""
 
-# Hard lifetime limit: self-terminate after 90 min regardless of benchmark
-# outcome.  Prevents runaway billing if Docker hangs or the script crashes
-# before reaching the shutdown at the bottom.
-MAX_LIFETIME=5400   # 90 minutes
+# Hard lifetime limit: self-terminate after 4 hours regardless of benchmark
+# outcome.  Pysam timeout per run is up to 3600s, and we allow 3 cold runs,
+# so worst case is ~3h of pysam + ~20 min setup = ~4h total.
+MAX_LIFETIME=14400  # 4 hours
 (sleep $MAX_LIFETIME \
  && echo "WATCHDOG: ${MAX_LIFETIME}s elapsed, force-terminating" \
  && aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID") &
@@ -83,9 +86,11 @@ docker run --rm --privileged \
     2>&1 | tee /mnt/work/results/coverage.log
 
 # -- upload results, then self-terminate --------------------------------------
-aws s3 cp /mnt/work/results/coverage.csv "s3://${S3_BUCKET}/${RESULT_PREFIX}/coverage.csv" --region "$REGION"
-aws s3 cp /mnt/work/results/coverage.log "s3://${S3_BUCKET}/${RESULT_PREFIX}/coverage.log" --region "$REGION"
-aws s3 cp /var/log/bamstorm-bench.log     "s3://${S3_BUCKET}/${RESULT_PREFIX}/boot.log"    --region "$REGION"
+# Use "|| true" so a failed upload (e.g. missing file, IAM hiccup) does not
+# prevent the shutdown that follows.
+aws s3 cp /mnt/work/results/coverage.csv "s3://${S3_BUCKET}/${RESULT_PREFIX}/coverage.csv" --region "$REGION" || true
+aws s3 cp /mnt/work/results/coverage.log "s3://${S3_BUCKET}/${RESULT_PREFIX}/coverage.log" --region "$REGION" || true
+aws s3 cp /var/log/bamstorm-bench.log     "s3://${S3_BUCKET}/${RESULT_PREFIX}/boot.log"    --region "$REGION" || true
 
 echo "Done. Results: s3://${S3_BUCKET}/${RESULT_PREFIX}/"
 echo "Self-terminating."

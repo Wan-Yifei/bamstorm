@@ -18,6 +18,8 @@ S3_BAI_KEY="test_15gb.bam.bai"
 S3_RESULTS_PREFIX="bamstorm-coverage-results"
 INSTANCE_PROFILE="bamstorm-bench-ec2-profile"
 CONTIG="chr4"
+START=""
+STOP=""
 TIMEOUT=3600
 
 usage() {
@@ -27,6 +29,8 @@ Usage: $0 -i <ecr-image-uri> [OPTIONS]
   -i URI        ECR image URI (required; printed by cfn-deploy.sh)
   -t TYPE       Instance type, must have local NVMe (default: i4i.4xlarge)
   -c CONTIG     Contig/chromosome name (default: chr4)
+  -s START      0-based region start, optional (default: full contig)
+  -e END        0-based region end,   optional (default: full contig)
   -T SECONDS    pysam pileup hard timeout per run (default: 3600)
   -p PROFILE    AWS CLI profile (default: admin)
   -r REGION     AWS region (default: us-east-1)
@@ -34,11 +38,13 @@ Usage: $0 -i <ecr-image-uri> [OPTIONS]
 EOF
 }
 
-while getopts "i:t:c:T:p:r:h" opt; do
+while getopts "i:t:c:s:e:T:p:r:h" opt; do
     case "$opt" in
         i) ECR_IMAGE_URI="$OPTARG" ;;
         t) INSTANCE_TYPE="$OPTARG" ;;
         c) CONTIG="$OPTARG" ;;
+        s) START="$OPTARG" ;;
+        e) STOP="$OPTARG" ;;
         T) TIMEOUT="$OPTARG" ;;
         p) PROFILE="$OPTARG" ;;
         r) REGION="$OPTARG" ;;
@@ -61,7 +67,18 @@ AMI_ID=$(aws ssm get-parameters --profile "$PROFILE" --region "$REGION" \
     --query 'Parameters[0].Value' --output text)
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-RESULT_PREFIX="${S3_RESULTS_PREFIX}/${TS}-${INSTANCE_TYPE}-${CONTIG}"
+# Build a region label for the result prefix (e.g. chr4 or chr4_0_10000000)
+if [[ -n "$START" && -n "$STOP" ]]; then
+    REGION_LABEL="${CONTIG}_${START}_${STOP}"
+else
+    REGION_LABEL="${CONTIG}"
+fi
+RESULT_PREFIX="${S3_RESULTS_PREFIX}/${TS}-${INSTANCE_TYPE}-${REGION_LABEL}"
+
+# Build optional --start / --stop flags for bench_coverage.py
+START_STOP_ARGS=""
+[[ -n "$START" ]] && START_STOP_ARGS="$START_STOP_ARGS --start $START"
+[[ -n "$STOP"  ]] && START_STOP_ARGS="$START_STOP_ARGS --stop $STOP"
 
 USER_DATA="$SCRIPT_DIR/.tmp-coverage-user-data-${TS}.sh"
 trap 'rm -f "$USER_DATA"' EXIT
@@ -74,6 +91,7 @@ sed \
     -e "s|__ECR_IMAGE_URI__|${ECR_IMAGE_URI}|g" \
     -e "s|__CONTIG__|${CONTIG}|g" \
     -e "s|__TIMEOUT__|${TIMEOUT}|g" \
+    -e "s|__START_STOP_ARGS__|${START_STOP_ARGS}|g" \
     "$SCRIPT_DIR/coverage-user-data.sh.tmpl" > "$USER_DATA"
 
 INSTANCE_ID=$(aws ec2 run-instances \
@@ -83,11 +101,11 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --iam-instance-profile "Name=${INSTANCE_PROFILE}" \
     --instance-initiated-shutdown-behavior terminate \
     --user-data "file://$(winpath "$USER_DATA")" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bamstorm-coverage-${CONTIG}},{Key=project,Value=bamstorm-bench}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bamstorm-coverage-${REGION_LABEL}},{Key=project,Value=bamstorm-bench}]" \
     --query 'Instances[0].InstanceId' --output text)
 
 echo "Launched ${INSTANCE_ID} (${INSTANCE_TYPE})"
-echo "Contig   : ${CONTIG}  (pysam timeout: ${TIMEOUT}s per run)"
+echo "Region   : ${REGION_LABEL}  (pysam timeout: ${TIMEOUT}s per run)"
 echo "Results  : s3://${S3_BUCKET}/${RESULT_PREFIX}/"
 echo ""
 echo "Watch log (available ~2 min after launch):"

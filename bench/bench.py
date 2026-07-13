@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BAM reader benchmark: bamstrom vs samtools vs rabbitbam vs pysam.
+BAM reader benchmark: bamstorm vs samtools vs rabbitbam vs pysam.
 
 Metrics per run:
   - Wall-clock elapsed time (seconds)
@@ -13,9 +13,12 @@ CLI flags override config values for one-off runs.
 
 import argparse
 import csv
+import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,6 +35,12 @@ try:
     HAS_PYSAM = True
 except ImportError:
     HAS_PYSAM = False
+
+try:
+    import bamstorm as _bamstorm_probe  # noqa: F401
+    HAS_BAMSTORM = True
+except ImportError:
+    HAS_BAMSTORM = False
 
 BENCH_COUNT_BIN  = "/app/bench_count"
 RABBITBAM_BIN    = "/opt/RabbitBAM/rabbitbam"
@@ -75,20 +84,76 @@ def file_mb(path: str) -> float:
 
 
 def fmt_row(r: dict, bam_mb: float) -> str:
+    tag = "  [warm]" if r.get("cache") == "warm" else ""
     if "error" in r:
         return (
-            f"  {r['tool']:<28}  threads={str(r['threads']):<4}  ERROR: {r['error']}"
+            f"  {r['tool']:<28}  threads={str(r['threads']):<4}  ERROR: {r['error']}{tag}"
         )
     throughput = bam_mb / r["elapsed"] if r["elapsed"] > 0 else float("inf")
     return (
         f"  {r['tool']:<28}  threads={str(r['threads']):<4}  "
-        f"{r['elapsed']:7.3f}s  {throughput:8.1f} MB/s  records={r['records']}"
+        f"{r['elapsed']:7.3f}s  {throughput:8.1f} MB/s  records={r['records']}{tag}"
     )
+
+
+# ── fio helpers ───────────────────────────────────────────────────────────────
+
+def detect_fs(path: str) -> str:
+    try:
+        out = subprocess.run(
+            ["df", "--output=fstype,target", path],
+            capture_output=True, text=True, check=True,
+        )
+        parts = out.stdout.strip().splitlines()
+        if len(parts) >= 2:
+            fstype, mount = parts[1].split(None, 1)
+            return f"{fstype} on {mount}"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _cached_kb() -> str:
+    """Return current OS page-cache size from /proc/meminfo, or 'N/A'."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("Cached:"):
+                    return line.split()[1] + " KB"
+    except OSError:
+        pass
+    return "N/A"
+
+
+def run_fio(fio_dir: str, numjobs: int, size: str, runtime: int):
+    """Return aggregate sequential read bandwidth in MB/s, or None on failure.
+
+    Uses a separate file per job (--directory, not --filename) so jobs do not
+    compete on the same file region, plus libaio + iodepth=32 to saturate the
+    NVMe command queue.  The original single-shared-file + sync-engine approach
+    under-measured i4i NVMe bandwidth by ~23x (122 MB/s vs real 2800 MB/s).
+    """
+    cmd = [
+        "fio", "--name=bamstorm-io",
+        "--rw=read", "--bs=1M",
+        f"--size={size}", f"--numjobs={numjobs}",
+        f"--runtime={runtime}", "--time_based",
+        "--direct=1", "--ioengine=libaio", "--iodepth=32",
+        "--group_reporting",
+        f"--directory={fio_dir}",
+        "--output-format=json",
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        bw_kb = json.loads(out.stdout)["jobs"][0]["read"]["bw"]
+        return bw_kb / 1024
+    except Exception:
+        return None
 
 
 # ── runners ───────────────────────────────────────────────────────────────────
 
-def run_bamstrom(bam: str, bai: str, threads: int) -> tuple[float, int]:
+def run_bamstorm(bam: str, bai: str, threads: int) -> tuple[float, int]:
     cmd = [BENCH_COUNT_BIN, "--threads", str(threads), bam, bai]
     t0 = time.perf_counter()
     try:
@@ -132,20 +197,111 @@ def run_pysam(bam: str, threads: int) -> tuple[float, int]:
     return time.perf_counter() - t0, n
 
 
-def drop_caches() -> None:
+def run_bamstorm_coverage(
+    bam: str, bai: str, contig: str,
+    start: int | None = None,
+    stop: int | None = None,
+) -> tuple[float, int]:
+    """Return (elapsed, total_coverage_bases) via Rust diff-array accumulation."""
+    import bamstorm
+    t0 = time.perf_counter()
+    af = bamstorm.AlignmentFile(bam, "rb", bai_path=bai)
+    cov = af.coverage(contig, start, stop)
+    total = sum(cov)
+    return time.perf_counter() - t0, total
+
+
+def run_pysam_pileup(
+    bam: str, contig: str,
+    start: int | None = None,
+    stop: int | None = None,
+) -> tuple[float, int]:
+    """Return (elapsed, total_coverage_bases) via pysam PileupColumn objects."""
+    t0 = time.perf_counter()
+    with pysam.AlignmentFile(bam, "rb") as f:
+        if start is not None and stop is not None:
+            total = sum(col.nsegments for col in f.pileup(contig, start, stop))
+        else:
+            total = sum(col.nsegments for col in f.pileup(contig))
+    return time.perf_counter() - t0, total
+
+
+def drop_caches(bam: str, bai: str) -> None:
+    """Evict bam/bai pages from the OS page cache for a true cold-cache read.
+
+    Tries the real kernel drop_caches sysctl first (works with root or
+    CAP_SYS_ADMIN, e.g. a --privileged container on EC2/HPC) — this is a
+    forced, non-advisory eviction. Falls back to the copy+fsync+fadvise
+    trick when that's not permitted (e.g. DNAnexus, where /proc/sys/vm is
+    read-only and fadvise alone proved unreliable on large-RAM machines).
+    """
+    mode = getattr(drop_caches, "_mode", None)
+    if mode is None:
+        try:
+            cached_before = _cached_kb()
+            with open("/proc/sys/vm/drop_caches", "w") as f:
+                f.write("3\n")
+            cached_after = _cached_kb()
+            print(
+                f"[info] drop_caches: real /proc/sys/vm/drop_caches (root) -- "
+                f"Cached {cached_before} -> {cached_after}",
+                flush=True,
+            )
+            drop_caches._mode = mode = "real"
+        except OSError:
+            print("[info] drop_caches: no root -- falling back to copy+fadvise(DONTNEED)", flush=True)
+            drop_caches._mode = mode = "fallback"
+
+    if mode == "real":
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+        return
+
+    import ctypes, ctypes.util
+    POSIX_FADV_DONTNEED = 4
     try:
-        with open("/proc/sys/vm/drop_caches", "w") as fh:
-            fh.write("1\n")
+        _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
     except OSError:
-        pass
+        _libc = None
+
+    for path in (bam, bai):
+        tmp = path + ".tmp_nocache"
+        try:
+            shutil.copy2(path, tmp)
+        except OSError as e:
+            print(f"[error] drop_caches: copy failed for {path}: {e} — aborting benchmark", flush=True)
+            sys.exit(0)
+        # fsync makes dirty write-pages clean so posix_fadvise DONTNEED can evict them.
+        if _libc is not None:
+            try:
+                wfd = os.open(tmp, os.O_RDWR)
+                try:
+                    os.fsync(wfd)
+                    size = os.fstat(wfd).st_size
+                    _libc.posix_fadvise(wfd, 0, size, POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(wfd)
+            except OSError as e:
+                print(f"[warn] drop_caches: fadvise failed for {tmp}: {e}", flush=True)
+        try:
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"[error] drop_caches: replace failed for {path}: {e} — aborting benchmark", flush=True)
+            sys.exit(0)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="BAM benchmark")
-    parser.add_argument("bam", help="Path to BAM file")
-    parser.add_argument("bai", help="Path to BAI index file")
+    parser.add_argument("bam", help="Path to BAM file (used by bamstorm; fallback for all tools)")
+    parser.add_argument("bai", help="Path to BAI index file (paired with bam)")
+    parser.add_argument("--bam2", default=None, metavar="FILE", help="BAM for samtools (default: bam)")
+    parser.add_argument("--bai2", default=None, metavar="FILE", help="BAI for samtools")
+    parser.add_argument("--bam3", default=None, metavar="FILE", help="BAM for rabbitbam (default: bam)")
+    parser.add_argument("--bai3", default=None, metavar="FILE", help="BAI for rabbitbam")
+    parser.add_argument("--bam4", default=None, metavar="FILE", help="BAM for pysam (default: bam)")
+    parser.add_argument("--bai4", default=None, metavar="FILE", help="BAI for pysam")
     parser.add_argument(
         "--config", default=str(DEFAULT_CONFIG),
         help=f"Path to TOML config file (default: {DEFAULT_CONFIG})",
@@ -162,29 +318,65 @@ def main() -> None:
         "--csv", metavar="FILE",
         help="Write results to CSV file (use '-' for stdout)",
     )
+    parser.add_argument(
+        "--repeat-index", type=int, default=1, metavar="N",
+        help="Repeat index label written to the CSV repeat column (default: 1)",
+    )
+    parser.add_argument(
+        "--append", action="store_true", default=False,
+        help="Append to existing CSV without writing header",
+    )
+    parser.add_argument(
+        "--warm-repeats", type=int, default=None, metavar="N",
+        help="Override config: warm-cache repetitions after cold runs (0 = skip)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
     max_cpus = os.cpu_count() or 1
 
     default_threads = cfg.get("benchmark", {}).get("threads", [1, 2, 4, 8, 0])
-    bamstrom_threads  = tool_threads(cfg, "bamstrom",  default_threads, max_cpus)
+    bamstorm_threads  = tool_threads(cfg, "bamstorm",  default_threads, max_cpus)
     samtools_threads  = tool_threads(cfg, "samtools",  default_threads, max_cpus)
     rabbitbam_threads = tool_threads(cfg, "rabbitbam", default_threads, max_cpus)
     pysam_threads     = tool_threads(cfg, "pysam",     default_threads, max_cpus)
 
-    repeats    = args.repeats if args.repeats is not None \
-                 else cfg.get("benchmark", {}).get("repeats", 3)
-    drop_cache = (not args.no_drop_cache) if args.no_drop_cache is not None \
-                 else cfg.get("benchmark", {}).get("drop_cache", True)
+    repeats      = args.repeats if args.repeats is not None \
+                   else cfg.get("benchmark", {}).get("repeats", 3)
+    drop_cache   = (not args.no_drop_cache) if args.no_drop_cache is not None \
+                   else cfg.get("benchmark", {}).get("drop_cache", True)
+    warm_repeats = args.warm_repeats if args.warm_repeats is not None \
+                   else cfg.get("benchmark", {}).get("warm_repeats", 0)
 
-    bam_mb = file_mb(args.bam)
+    # Coverage benchmark config
+    cov_cfg     = cfg.get("coverage", {})
+    cov_enabled = cov_cfg.get("enabled", False)
+    cov_contig  = cov_cfg.get("contig", "chrM")
+    cov_start   = cov_cfg.get("start", None)
+    cov_stop    = cov_cfg.get("stop", None)
+    cov_region  = (
+        f"{cov_contig}:{cov_start}-{cov_stop}"
+        if cov_start is not None and cov_stop is not None
+        else cov_contig
+    )
+
+    # Per-tool BAM/BAI: fall back to the primary bam/bai if not specified.
+    # Tool assignment: bamstorm=bam1, samtools=bam2, rabbitbam=bam3, pysam=bam4
+    bam1, bai1 = args.bam, args.bai
+    bam2, bai2 = args.bam2 or args.bam, args.bai2 or args.bai
+    bam3, bai3 = args.bam3 or args.bam, args.bai3 or args.bai
+    bam4, bai4 = args.bam4 or args.bam, args.bai4 or args.bai
+
+    bam_mb = file_mb(bam1)
 
     print(f"\nConfig   : {args.config}")
-    print(f"BAM file : {args.bam}  ({bam_mb:.1f} MB)")
+    print(f"BAM 1 (bamstorm)  : {bam1}  ({bam_mb:.1f} MB)")
+    print(f"BAM 2 (samtools)  : {bam2}")
+    print(f"BAM 3 (rabbitbam) : {bam3}")
+    print(f"BAM 4 (pysam)     : {bam4}")
     print(f"CPU cores: {max_cpus}")
-    print(f"Repeats  : {repeats}  (best of N reported)")
-    print(f"threads  : {default_threads} (bamstrom={bamstrom_threads} samtools={samtools_threads} "
+    print(f"Repeats  : cold={repeats} (best of N), warm={warm_repeats}")
+    print(f"threads  : {default_threads} (bamstorm={bamstorm_threads} samtools={samtools_threads} "
           f"rabbitbam={rabbitbam_threads} pysam={pysam_threads})")
     print()
     print(f"  {'Tool':<28}  {'':10}  {'elapsed':>9}  {'throughput':>10}  records")
@@ -192,67 +384,104 @@ def main() -> None:
 
     results: list[dict] = []
 
-    def timed_best(fn, *fn_args) -> tuple[float, int]:
-        best, count = float("inf"), 0
+    # ── fio disk bandwidth ────────────────────────────────────────────────────
+    fio_cfg     = cfg.get("fio", {})
+    fio_enabled = fio_cfg.get("enabled", True)
+
+    if fio_enabled:
+        fio_size    = fio_cfg.get("size",             "1g")
+        fio_runtime = fio_cfg.get("runtime",          20)
+        fio_par_n   = fio_cfg.get("numjobs_parallel", 0)
+        fio_par_n   = max_cpus if fio_par_n == 0 else fio_par_n
+        bam_dir     = os.path.dirname(os.path.abspath(args.bam))
+        fio_dir     = fio_cfg.get("tmpdir", bam_dir)
+
+        print("  [fio disk bandwidth]")
+        if shutil.which("fio"):
+            print(f"  filesystem : {detect_fs(args.bam)}")
+            fio_subdir = tempfile.mkdtemp(dir=fio_dir, prefix=".bamstorm_fio_")
+            seq_bw = par_bw = None
+            try:
+                seq_bw = run_fio(fio_subdir, 1,         fio_size, fio_runtime)
+                par_bw = run_fio(fio_subdir, fio_par_n, fio_size, fio_runtime)
+            finally:
+                shutil.rmtree(fio_subdir, ignore_errors=True)
+            if seq_bw is not None:
+                print(f"  sequential (1 job)          : {seq_bw:8.1f} MB/s")
+                results.append({"tool": "fio-seq", "threads": 1,
+                                 "elapsed": fio_runtime, "throughput": seq_bw, "records": ""})
+            if par_bw is not None:
+                print(f"  parallel   ({fio_par_n} jobs) : {par_bw:8.1f} MB/s")
+                results.append({"tool": "fio-par", "threads": fio_par_n,
+                                 "elapsed": fio_runtime, "throughput": par_bw, "records": ""})
+            if seq_bw is None and par_bw is None:
+                print("  fio failed — check permissions or available disk space")
+        else:
+            print("  fio not installed — skipped")
+        print()
+
+    def run_repeats(bam, bai, fn, *fn_args) -> list[tuple[float, int]]:
+        runs = []
         for _ in range(repeats):
             if drop_cache:
-                drop_caches()
-            elapsed, count = fn(*fn_args)
-            if elapsed < best:
-                best = elapsed
-        return best, count
+                drop_caches(bam, bai)
+            runs.append(fn(*fn_args))
+        return runs
 
-    def record_ok(tool: str, threads: int, elapsed: float, count: int) -> dict:
-        return {"tool": tool, "threads": threads, "elapsed": elapsed,
+    def record_ok(tool: str, threads: int, runs: list[tuple[float, int]],
+                  cache: str = "cold") -> dict:
+        elapsed, count = min(runs, key=lambda x: x[0])
+        return {"tool": tool, "threads": threads, "cache": cache, "elapsed": elapsed,
                 "throughput": bam_mb / elapsed if elapsed > 0 else float("inf"),
-                "records": count}
+                "records": count,
+                "all_elapsed": [e for e, _ in runs]}
 
-    def record_err(tool: str, threads: int, error: str) -> dict:
-        return {"tool": tool, "threads": threads, "error": error}
+    def record_err(tool: str, threads: int, error: str, cache: str = "cold") -> dict:
+        return {"tool": tool, "threads": threads, "cache": cache, "error": error}
 
-    # bamstrom
-    print("  [bamstrom]")
-    for t in bamstrom_threads:
+    # bamstorm → bam1
+    print("  [bamstorm]")
+    for t in bamstorm_threads:
         try:
-            elapsed, count = timed_best(run_bamstrom, args.bam, args.bai, t)
-            r = record_ok("bamstrom", t, elapsed, count)
+            runs = run_repeats(bam1, bai1, run_bamstorm, bam1, bai1, t)
+            r = record_ok("bamstorm", t, runs)
         except Exception as e:
-            r = record_err("bamstrom", t, str(e))
+            r = record_err("bamstorm", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 
-    # samtools
+    # samtools → bam2
     print()
     print("  [samtools]")
     for t in samtools_threads:
         try:
-            elapsed, count = timed_best(run_samtools, args.bam, t)
-            r = record_ok("samtools view -c", t, elapsed, count)
+            runs = run_repeats(bam2, bai2, run_samtools, bam2, t)
+            r = record_ok("samtools view -c", t, runs)
         except Exception as e:
             r = record_err("samtools view -c", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 
-    # rabbitbam
+    # rabbitbam → bam3
     print()
     print("  [rabbitbam]")
     for t in rabbitbam_threads:
         try:
-            elapsed, count = timed_best(run_rabbitbam, args.bam, t)
-            r = record_ok("rabbitbam benchmark_count", t, elapsed, count)
+            runs = run_repeats(bam3, bai3, run_rabbitbam, bam3, t)
+            r = record_ok("rabbitbam benchmark_count", t, runs)
         except Exception as e:
             r = record_err("rabbitbam benchmark_count", t, str(e))
         print(fmt_row(r, bam_mb))
         results.append(r)
 
-    # pysam
+    # pysam → bam4
     print()
     print("  [pysam]")
     if HAS_PYSAM:
         for t in pysam_threads:
             try:
-                elapsed, count = timed_best(run_pysam, args.bam, t)
-                r = record_ok("pysam fetch(until_eof)", t, elapsed, count)
+                runs = run_repeats(bam4, bai4, run_pysam, bam4, t)
+                r = record_ok("pysam fetch(until_eof)", t, runs)
             except Exception as e:
                 r = record_err("pysam fetch(until_eof)", t, str(e))
             print(fmt_row(r, bam_mb))
@@ -260,27 +489,152 @@ def main() -> None:
     else:
         print("  pysam not installed — skipped")
 
+    # ── coverage benchmark (Rust diff-array vs pysam pileup) ─────────────────
+    if cov_enabled:
+        print()
+        print(f"  [coverage: {cov_region}]")
+
+        if HAS_BAMSTORM:
+            try:
+                runs = run_repeats(bam1, bai1,
+                                   run_bamstorm_coverage, bam1, bai1,
+                                   cov_contig, cov_start, cov_stop)
+                r = record_ok("bamstorm coverage", 1, runs)
+            except Exception as e:
+                r = record_err("bamstorm coverage", 1, str(e))
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+        else:
+            print("  bamstorm not installed — skipped")
+
+        if HAS_PYSAM:
+            try:
+                runs = run_repeats(bam1, bai1,
+                                   run_pysam_pileup, bam1,
+                                   cov_contig, cov_start, cov_stop)
+                r = record_ok("pysam pileup", 1, runs)
+            except Exception as e:
+                r = record_err("pysam pileup", 1, str(e))
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+        else:
+            print("  pysam not installed — skipped")
+
+    # ── warm-cache runs ────────────────────────────────────────────────────────
+    if warm_repeats > 0:
+        print()
+        print(f"  --- warm cache (no eviction, repeats={warm_repeats}) ---")
+
+        print()
+        print("  [bamstorm]  [warm]")
+        for t in bamstorm_threads:
+            try:
+                runs = [run_bamstorm(bam1, bai1, t) for _ in range(warm_repeats)]
+                r = record_ok("bamstorm", t, runs, cache="warm")
+            except Exception as e:
+                r = record_err("bamstorm", t, str(e), cache="warm")
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+
+        print()
+        print("  [samtools]  [warm]")
+        for t in samtools_threads:
+            try:
+                runs = [run_samtools(bam2, t) for _ in range(warm_repeats)]
+                r = record_ok("samtools view -c", t, runs, cache="warm")
+            except Exception as e:
+                r = record_err("samtools view -c", t, str(e), cache="warm")
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+
+        print()
+        print("  [rabbitbam]  [warm]")
+        for t in rabbitbam_threads:
+            try:
+                runs = [run_rabbitbam(bam3, t) for _ in range(warm_repeats)]
+                r = record_ok("rabbitbam benchmark_count", t, runs, cache="warm")
+            except Exception as e:
+                r = record_err("rabbitbam benchmark_count", t, str(e), cache="warm")
+            print(fmt_row(r, bam_mb))
+            results.append(r)
+
+        if HAS_PYSAM:
+            print()
+            print("  [pysam]  [warm]")
+            for t in pysam_threads:
+                try:
+                    runs = [run_pysam(bam4, t) for _ in range(warm_repeats)]
+                    r = record_ok("pysam fetch(until_eof)", t, runs, cache="warm")
+                except Exception as e:
+                    r = record_err("pysam fetch(until_eof)", t, str(e), cache="warm")
+                print(fmt_row(r, bam_mb))
+                results.append(r)
+
+        if cov_enabled:
+            print()
+            print(f"  [coverage: {cov_region}]  [warm]")
+
+            if HAS_BAMSTORM:
+                try:
+                    runs = [run_bamstorm_coverage(bam1, bai1, cov_contig, cov_start, cov_stop)
+                            for _ in range(warm_repeats)]
+                    r = record_ok("bamstorm coverage", 1, runs, cache="warm")
+                except Exception as e:
+                    r = record_err("bamstorm coverage", 1, str(e), cache="warm")
+                print(fmt_row(r, bam_mb))
+                results.append(r)
+
+            if HAS_PYSAM:
+                try:
+                    runs = [run_pysam_pileup(bam1, cov_contig, cov_start, cov_stop)
+                            for _ in range(warm_repeats)]
+                    r = record_ok("pysam pileup", 1, runs, cache="warm")
+                except Exception as e:
+                    r = record_err("pysam pileup", 1, str(e), cache="warm")
+                print(fmt_row(r, bam_mb))
+                results.append(r)
+
     print()
 
     # CSV output
     if args.csv:
-        fh = sys.stdout if args.csv == "-" else open(args.csv, "w", newline="")
+        mode = "a" if args.append else "w"
+        fh = sys.stdout if args.csv == "-" else open(args.csv, mode, newline="")
         try:
             writer = csv.DictWriter(
                 fh,
-                fieldnames=["tool", "threads", "elapsed_s", "throughput_mb_s", "records", "error"],
+                fieldnames=["tool", "threads", "cache", "repeat", "elapsed_s", "throughput_mb_s", "records", "error"],
                 extrasaction="ignore",
             )
-            writer.writeheader()
+            if not args.append:
+                writer.writeheader()
             for r in results:
-                writer.writerow({
-                    "tool":             r["tool"],
-                    "threads":          r["threads"],
-                    "elapsed_s":        r.get("elapsed", ""),
-                    "throughput_mb_s":  f"{r['throughput']:.1f}" if "throughput" in r else "",
-                    "records":          r.get("records", ""),
-                    "error":            r.get("error", ""),
-                })
+                if "error" in r:
+                    writer.writerow({
+                        "tool": r["tool"], "threads": r["threads"],
+                        "cache": r.get("cache", "cold"), "repeat": "",
+                        "elapsed_s": "", "throughput_mb_s": "", "records": "",
+                        "error": r["error"],
+                    })
+                elif "all_elapsed" in r:
+                    for i, elapsed in enumerate(r["all_elapsed"], args.repeat_index):
+                        writer.writerow({
+                            "tool": r["tool"], "threads": r["threads"],
+                            "cache": r.get("cache", "cold"), "repeat": i,
+                            "elapsed_s": elapsed,
+                            "throughput_mb_s": f"{bam_mb / elapsed:.1f}" if elapsed > 0 else "",
+                            "records": r["records"],
+                            "error": "",
+                        })
+                else:
+                    writer.writerow({
+                        "tool": r["tool"], "threads": r["threads"],
+                        "cache": r.get("cache", "cold"), "repeat": "",
+                        "elapsed_s": r.get("elapsed", ""),
+                        "throughput_mb_s": f"{r['throughput']:.1f}" if "throughput" in r else "",
+                        "records": r.get("records", ""),
+                        "error": "",
+                    })
         finally:
             if fh is not sys.stdout:
                 fh.close()

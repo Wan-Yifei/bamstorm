@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-version bamstrom benchmark.
+Cross-version bamstorm benchmark.
 
 Builds bench_count for each git tag via temporary worktrees, runs the same
 thread-scaling benchmark for every version, and collects results alongside
@@ -241,7 +241,7 @@ def main() -> None:
 
     results: list[dict] = []
 
-    # ── per-tag bamstrom benchmark ────────────────────────────────────────────
+    # ── per-tag bamstorm benchmark ────────────────────────────────────────────
     with tempfile.TemporaryDirectory(prefix="bench_history_") as tmp:
         build_dir = Path(tmp)
 
@@ -259,7 +259,7 @@ def main() -> None:
                 except subprocess.CalledProcessError as e:
                     print(f"  [build] FAILED: {e}")
                     for t in threads:
-                        results.append(err(tag, "bamstrom", t, f"build failed: {e}"))
+                        results.append(err(tag, "bamstorm", t, f"build failed: {e}"))
                     continue
 
             for t in threads:
@@ -267,9 +267,9 @@ def main() -> None:
                     elapsed, count = timed_best(
                         run_bench_count, repeats, drop_cache, binary, args.bam, args.bai, t
                     )
-                    r = ok(tag, "bamstrom", t, elapsed, count, bam_mb)
+                    r = ok(tag, "bamstorm", t, elapsed, count, bam_mb)
                 except Exception as e:
-                    r = err(tag, "bamstrom", t, str(e))
+                    r = err(tag, "bamstorm", t, str(e))
                 print(fmt(r))
                 results.append(r)
 

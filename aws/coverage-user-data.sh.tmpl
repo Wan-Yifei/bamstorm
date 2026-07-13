@@ -1,0 +1,99 @@
+#!/bin/bash
+# EC2 user-data for the bamstorm vs pysam coverage benchmark.
+# Templated by launch_coverage.sh -- placeholders substituted with sed.
+# ASCII only (Windows file:// encoding constraint).
+# Note: intentionally NOT using set -e so that a failed S3 upload does not
+# prevent the shutdown at the end.  Individual critical steps still exit
+# explicitly with `|| { ...; exit 1; }`.
+set -uo pipefail
+exec > >(tee /var/log/bamstorm-bench.log) 2>&1
+
+REGION="__REGION__"
+S3_BUCKET="__S3_BUCKET__"
+S3_BAM_KEY="__S3_BAM_KEY__"
+S3_BAI_KEY="__S3_BAI_KEY__"
+RESULT_PREFIX="__RESULT_PREFIX__"
+ECR_IMAGE_URI="__ECR_IMAGE_URI__"
+CONTIG="__CONTIG__"
+TIMEOUT="__TIMEOUT__"
+START_STOP_ARGS="__START_STOP_ARGS__"
+
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
+echo "=== Bamstorm Coverage Benchmark ==="
+echo "Instance : $(curl -s http://169.254.169.254/latest/meta-data/instance-type)  ($INSTANCE_ID)"
+echo "CPUs     : $(nproc)"
+echo "RAM      : $(free -h | awk '/^Mem/{print $2}')"
+echo "Image    : $ECR_IMAGE_URI"
+echo "Contig   : $CONTIG ${START_STOP_ARGS}  (pysam timeout: ${TIMEOUT}s)"
+echo ""
+
+# Hard lifetime limit: self-terminate after 4 hours regardless of benchmark
+# outcome.  Pysam timeout per run is up to 3600s, and we allow 3 cold runs,
+# so worst case is ~3h of pysam + ~20 min setup = ~4h total.
+MAX_LIFETIME=14400  # 4 hours
+(sleep $MAX_LIFETIME \
+ && echo "WATCHDOG: ${MAX_LIFETIME}s elapsed, force-terminating" \
+ && aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID") &
+WATCHDOG_PID=$!
+echo "Watchdog PID ${WATCHDOG_PID} (hard limit: ${MAX_LIFETIME}s)"
+echo ""
+
+# -- find + mount local NVMe instance store ----------------------------------
+ROOT_DISK=$(lsblk -ndo PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null || true)
+NVME_DEV=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1}' | grep -v "^${ROOT_DISK}\$" | head -1)
+if [[ -z "$NVME_DEV" ]]; then
+    echo "ERROR: no local NVMe instance store -- use i4i/i3en instance type." >&2
+    shutdown -h now
+    exit 1
+fi
+mkfs.ext4 -F "/dev/${NVME_DEV}"
+mkdir -p /mnt/work
+mount "/dev/${NVME_DEV}" /mnt/work
+echo "Mounted /dev/${NVME_DEV} at /mnt/work: $(df -h /mnt/work | tail -1)"
+mkdir -p /mnt/work/data /mnt/work/results
+
+# -- docker + awscli ----------------------------------------------------------
+apt-get update -y
+apt-get install -y --no-install-recommends docker.io awscli
+systemctl enable --now docker
+
+# -- ECR login + pull ---------------------------------------------------------
+aws ecr get-login-password --region "$REGION" \
+    | docker login --username AWS --password-stdin "${ECR_IMAGE_URI%%/*}"
+docker pull "$ECR_IMAGE_URI"
+
+# -- download BAM + BAI (one copy; bench_coverage.py drops caches internally) -
+echo "Downloading BAM..."
+aws s3 cp "s3://${S3_BUCKET}/${S3_BAM_KEY}" /mnt/work/data/input.bam --region "$REGION"
+aws s3 cp "s3://${S3_BUCKET}/${S3_BAI_KEY}" /mnt/work/data/input.bam.bai --region "$REGION"
+touch /mnt/work/data/input.bam.bai
+echo "Download complete: $(du -sh /mnt/work/data/input.bam | cut -f1)"
+
+# -- run coverage benchmark ---------------------------------------------------
+# --privileged: bench_coverage.py writes /proc/sys/vm/drop_caches for real
+# cold-cache eviction between each timed run.
+docker run --rm --privileged \
+    -v /mnt/work/data:/data \
+    -v /mnt/work/results:/results \
+    "$ECR_IMAGE_URI" \
+    python3 /app/bench_coverage.py \
+        /data/input.bam /data/input.bam.bai \
+        --contig "$CONTIG" \
+        $START_STOP_ARGS \
+        --repeats 3 \
+        --warm-repeats 1 \
+        --timeout "$TIMEOUT" \
+        --csv /results/coverage.csv \
+    2>&1 | tee /mnt/work/results/coverage.log
+
+# -- upload results, then self-terminate --------------------------------------
+# Use "|| true" so a failed upload (e.g. missing file, IAM hiccup) does not
+# prevent the shutdown that follows.
+aws s3 cp /mnt/work/results/coverage.csv "s3://${S3_BUCKET}/${RESULT_PREFIX}/coverage.csv" --region "$REGION" || true
+aws s3 cp /mnt/work/results/coverage.log "s3://${S3_BUCKET}/${RESULT_PREFIX}/coverage.log" --region "$REGION" || true
+aws s3 cp /var/log/bamstorm-bench.log     "s3://${S3_BUCKET}/${RESULT_PREFIX}/boot.log"    --region "$REGION" || true
+
+echo "Done. Results: s3://${S3_BUCKET}/${RESULT_PREFIX}/"
+echo "Self-terminating."
+shutdown -h now

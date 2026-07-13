@@ -1,25 +1,40 @@
-# Benchmark configuration for bamstrom vs samtools vs rabbitbam vs pysam.
+# Benchmark configuration for bamstorm vs samtools vs rabbitbam vs pysam.
 # Edit this file to control which thread counts are tested.
 # 0 is a special value meaning "use all available CPU cores".
 
 [benchmark]
 # Unified thread counts applied to all tools unless overridden below.
-threads = [1, 2, 4, 8, 0]
+threads = [2, 4, 8, 16, 32, 64, 128]
 # Number of timed repetitions per configuration; the best (fastest) time is reported.
 repeats = 3
+# Number of warm-cache repetitions run after all cold runs (0 = skip).
+# No cache eviction between warm repeats; measures memory-bandwidth ceiling.
+warm_repeats = 1
 # Drop OS page cache before each run for cold-cache IO measurement.
 # Requires root on Linux; silently skipped otherwise.
 drop_cache = true
 
+[fio]
+# Set to false to skip disk bandwidth measurement entirely.
+enabled = true
+# Size of the temporary test file fio creates (e.g. "1g", "4g").
+size = "1g"
+# How long each fio run lasts (seconds).
+runtime = 20
+# Number of parallel jobs for the parallel-read test. 0 = all CPU cores.
+numjobs_parallel = 0
+# Directory for the fio temp file. Defaults to the BAM file's directory.
+# tmpdir = "/tmp"
+
 # Per-tool overrides — uncomment to diverge from benchmark.threads.
-# [bamstrom]
-# threads = [1, 2, 4, 8, 0]
+# [bamstorm]
+# threads = [2, 4, 8, 16, 32, 64, 128]
 
 # [samtools]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]
 
 # [rabbitbam]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]
 
 # [pysam]
-# threads = [1, 2, 4, 8, 0]
+# threads = [2, 4, 8, 16, 32, 64, 128]

@@ -1,0 +1,126 @@
+#!/bin/bash
+# Standalone diagnostic: verify (1) true parallel local-NVMe bandwidth with a
+# properly-configured fio (separate files per job, real iodepth/libaio -- the
+# original bench.py fio test shares one small file across jobs with no
+# iodepth, which under-measures NVMe bandwidth), and (2) whether
+# /proc/sys/vm/drop_caches actually evicts the page cache, both run directly
+# on the host and via a --privileged container (the same code path bench.py
+# uses in production).
+#
+# Does not need the bamstorm ECR image -- reuses the existing instance
+# profile for S3 read/write only.
+set -euo pipefail
+exec > >(tee /var/log/bamstorm-diag.log) 2>&1
+
+REGION="__REGION__"
+S3_BUCKET="__S3_BUCKET__"
+S3_BAM_KEY="__S3_BAM_KEY__"
+RESULT_PREFIX="__RESULT_PREFIX__"
+
+echo "=== Bamstorm AWS Diagnostic: fio bandwidth + drop_caches verification ==="
+echo "Instance : $(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+echo "CPUs     : $(nproc)"
+echo "RAM      : $(free -h | awk '/^Mem/{print $2}')"
+echo ""
+
+# -- mount local NVMe (same detection logic as launch.sh) --------------------
+ROOT_DISK=$(lsblk -ndo PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null || true)
+NVME_DEV=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1}' | grep -v "^${ROOT_DISK}\$" | head -1)
+if [[ -z "$NVME_DEV" ]]; then
+    echo "ERROR: no local NVMe instance store on this instance type." >&2
+    shutdown -h now
+    exit 1
+fi
+mkfs.ext4 -F "/dev/${NVME_DEV}"
+mkdir -p /mnt/work
+mount "/dev/${NVME_DEV}" /mnt/work
+echo "Mounted /dev/${NVME_DEV} at /mnt/work: $(df -h /mnt/work | tail -1)"
+mkdir -p /mnt/work/fio /mnt/work/data /mnt/work/results
+
+apt-get update -y
+apt-get install -y --no-install-recommends fio docker.io awscli bc
+systemctl enable --now docker
+
+CPUS=$(nproc)
+
+echo ""
+echo "=== Part 1: fio bandwidth (separate file per job, iodepth=32, libaio) ==="
+echo "--- sequential, 1 job, 8g, iodepth=32 ---"
+fio --name=seq-read --directory=/mnt/work/fio --rw=read --bs=1M \
+    --size=8g --ioengine=libaio --iodepth=32 --direct=1 \
+    --runtime=30 --time_based --group_reporting \
+    --output-format=json > /mnt/work/results/fio-seq.json
+SEQ_BW=$(python3 -c "import json; print(json.load(open('/mnt/work/results/fio-seq.json'))['jobs'][0]['read']['bw']/1024)")
+echo "Sequential (1 job, iodepth=32): ${SEQ_BW} MB/s"
+
+echo "--- parallel, ${CPUS} jobs, 8g each (separate files), iodepth=32 each ---"
+fio --name=par-read --directory=/mnt/work/fio --rw=read --bs=1M \
+    --size=8g --ioengine=libaio --iodepth=32 --direct=1 \
+    --numjobs="${CPUS}" --runtime=30 --time_based --group_reporting \
+    --output-format=json > /mnt/work/results/fio-par.json
+PAR_BW=$(python3 -c "import json; print(json.load(open('/mnt/work/results/fio-par.json'))['jobs'][0]['read']['bw']/1024)")
+echo "Parallel (${CPUS} jobs, iodepth=32 each): ${PAR_BW} MB/s"
+rm -rf /mnt/work/fio
+echo ""
+
+echo "=== Part 2: drop_caches verification ==="
+meminfo_cached() { awk '/^Cached:/{print $2}' /proc/meminfo; }
+
+echo "Downloading test BAM..."
+aws s3 cp "s3://${S3_BUCKET}/${S3_BAM_KEY}" /mnt/work/data/test.bam --region "$REGION"
+sync
+BAM_MB=$(( $(stat -c%s /mnt/work/data/test.bam) / 1024 / 1024 ))
+echo "BAM size: ${BAM_MB} MB"
+echo "Cached (KB) after download : $(meminfo_cached)"
+
+echo "--- warm-up read (populate page cache) ---"
+dd if=/mnt/work/data/test.bam of=/dev/null bs=1M 2>/dev/null
+echo "Cached (KB) after warm-up read : $(meminfo_cached)"
+
+echo "--- re-read while still warm (expect: fast, served from RAM) ---"
+T0=$(date +%s.%N)
+dd if=/mnt/work/data/test.bam of=/dev/null bs=1M 2>/dev/null
+T1=$(date +%s.%N)
+WARM_TIME=$(echo "$T1 - $T0" | bc)
+echo "Warm re-read time: ${WARM_TIME}s  ($(echo "$BAM_MB / $WARM_TIME" | bc) MB/s)"
+
+echo ""
+echo "--- drop_caches directly on host (no container) ---"
+echo 3 > /proc/sys/vm/drop_caches
+echo "Cached (KB) immediately after host-level drop_caches : $(meminfo_cached)"
+T0=$(date +%s.%N)
+dd if=/mnt/work/data/test.bam of=/dev/null bs=1M 2>/dev/null
+T1=$(date +%s.%N)
+HOST_COLD_TIME=$(echo "$T1 - $T0" | bc)
+echo "Read time after host-level drop_caches: ${HOST_COLD_TIME}s  ($(echo "$BAM_MB / $HOST_COLD_TIME" | bc) MB/s)"
+
+echo ""
+echo "--- re-warm, then drop_caches via --privileged container (bench.py's actual code path) ---"
+dd if=/mnt/work/data/test.bam of=/dev/null bs=1M 2>/dev/null
+echo "Cached (KB) after re-warm : $(meminfo_cached)"
+docker run --rm --privileged debian:bookworm-slim sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+echo "Cached (KB) immediately after container drop_caches : $(meminfo_cached)"
+T0=$(date +%s.%N)
+dd if=/mnt/work/data/test.bam of=/dev/null bs=1M 2>/dev/null
+T1=$(date +%s.%N)
+CONTAINER_COLD_TIME=$(echo "$T1 - $T0" | bc)
+echo "Read time after container drop_caches: ${CONTAINER_COLD_TIME}s  ($(echo "$BAM_MB / $CONTAINER_COLD_TIME" | bc) MB/s)"
+
+echo ""
+echo "=== Summary ==="
+{
+  echo "metric,value"
+  echo "instance_type,$(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+  echo "fio_seq_iodepth32_mb_s,${SEQ_BW}"
+  echo "fio_par_iodepth32_mb_s,${PAR_BW}"
+  echo "bam_size_mb,${BAM_MB}"
+  echo "warm_reread_time_s,${WARM_TIME}"
+  echo "host_drop_caches_reread_time_s,${HOST_COLD_TIME}"
+  echo "container_drop_caches_reread_time_s,${CONTAINER_COLD_TIME}"
+} | tee /mnt/work/results/diag_summary.csv
+
+aws s3 cp /mnt/work/results/diag_summary.csv "s3://${S3_BUCKET}/${RESULT_PREFIX}/diag_summary.csv" --region "$REGION"
+aws s3 cp /var/log/bamstorm-diag.log "s3://${S3_BUCKET}/${RESULT_PREFIX}/diag.log" --region "$REGION"
+
+echo "Done. Results: s3://${S3_BUCKET}/${RESULT_PREFIX}/"
+shutdown -h now

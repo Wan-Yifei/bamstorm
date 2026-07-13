@@ -1,8 +1,8 @@
-# BAM Parallel Reader Comparison: bamstrom vs RabbitBAM vs quickbam
+# BAM Parallel Reader Comparison: bamstorm vs RabbitBAM vs quickbam
 
 ## Overview
 
-| | bamstrom | RabbitBAM | quickbam |
+| | bamstorm | RabbitBAM | quickbam |
 |---|---|---|---|
 | Language | Rust | C++ | C++ |
 | Parallelism | rayon (work-stealing) | pthreads (manual pipeline) | Intel TBB |
@@ -13,7 +13,7 @@
 
 ## Threading Model
 
-### bamstrom
+### bamstorm
 
 ```
 rayon thread pool
@@ -37,7 +37,7 @@ read_thread (×1) → [BamRead queue] → compress_thread (×N) → [BamCompress
 A strict three-stage pipeline backed by ring buffers, mutexes, and busy-polling
 (`sleep_for 1–5 ms`). I/O and decompression overlap, which helps at low thread
 counts. However, the single-threaded I/O and single-threaded parse stages become
-bottlenecks at high concurrency (degraded to 41 s at 128 threads vs bamstrom's 3.8 s).
+bottlenecks at high concurrency (degraded to 41 s at 128 threads vs bamstorm's 3.8 s).
 CPU affinity is pinned per thread via `pthread_setaffinity_np`.
 
 ### quickbam
@@ -60,7 +60,7 @@ the file into 10 MB chunks and heuristically scanning for BGZF magic bytes.
 
 ## I/O Strategy
 
-| | bamstrom | RabbitBAM | quickbam |
+| | bamstorm | RabbitBAM | quickbam |
 |---|---|---|---|
 | Read mechanism | `File::open` + `read_exact` per interval | Dedicated I/O thread, block-by-block `fread` | `pread` entire region into heap buffer |
 | I/O parallelism | Each worker reads independently | Single thread, sequential | Each worker `pread`s its own region |
@@ -72,7 +72,7 @@ the file into 10 MB chunks and heuristically scanning for BGZF magic bytes.
 
 ## Record Counting Hot Path
 
-### bamstrom (current)
+### bamstorm (current)
 
 ```rust
 loop {
@@ -104,7 +104,7 @@ inner loop for BAM record counting.
 
 All three tools use libdeflate. The differences lie in how it is invoked:
 
-| | bamstrom | RabbitBAM | quickbam |
+| | bamstorm | RabbitBAM | quickbam |
 |---|---|---|---|
 | Call path | noodles-bgzf → libdeflate C API | Direct libdeflate C API | Direct libdeflate C API |
 | Granularity | Per-block, serialized within each worker | Per-block, parallel across pipeline workers | Per-block, TBB parallel within each region |
@@ -114,7 +114,7 @@ All three tools use libdeflate. The differences lie in how it is invoked:
 
 ## Index Usage
 
-| | bamstrom | RabbitBAM | quickbam |
+| | bamstorm | RabbitBAM | quickbam |
 |---|---|---|---|
 | Index format | BAI | BAI | BAI (optional) |
 | Index-free reading | No | No | **Yes** (heuristic BGZF scan) |
@@ -125,7 +125,7 @@ All three tools use libdeflate. The differences lie in how it is invoked:
 
 ## Benchmark Results (899 M records, 128-core machine)
 
-| Threads | bamstrom | RabbitBAM | samtools |
+| Threads | bamstorm | RabbitBAM | samtools |
 |---------|----------|-----------|---------|
 | 1 | 270 s / 181 MB/s | 231 s / 212 MB/s | 253 s / 193 MB/s |
 | 2 | 128 s / 383 MB/s | 117 s / 419 MB/s | — |
@@ -135,14 +135,14 @@ All three tools use libdeflate. The differences lie in how it is invoked:
 
 - **Low thread counts (1–8):** RabbitBAM leads by ~15%, primarily due to I/O–decompress
   pipeline overlap and body-skipping in the record scan.
-- **High thread counts (128):** bamstrom leads by ~10×. RabbitBAM's single-threaded I/O
+- **High thread counts (128):** bamstorm leads by ~10×. RabbitBAM's single-threaded I/O
   and single-threaded parse stages are fully saturated, starving the decompression workers.
 
 ---
 
 ## Pros & Cons
 
-### bamstrom
+### bamstorm
 
 **Strengths**
 - Excellent scaling at high thread counts — no single-threaded bottleneck
@@ -189,16 +189,16 @@ All three tools use libdeflate. The differences lie in how it is invoked:
 
 1. **Pipeline vs. autonomous workers.** RabbitBAM's pipeline gives an edge at low
    thread counts by overlapping I/O and decompression. At high thread counts its
-   single-threaded I/O and parse stages become the ceiling. bamstrom and quickbam's
+   single-threaded I/O and parse stages become the ceiling. bamstorm and quickbam's
    per-worker autonomous model scales linearly.
 
 2. **Skipping record bodies.** quickbam's `nfo_iterator` is the most impactful
-   single optimization for counting workloads. Applying it to bamstrom is expected
+   single optimization for counting workloads. Applying it to bamstorm is expected
    to close most of the remaining ~15% gap against RabbitBAM at low thread counts.
 
 3. **Index-free reading.** quickbam's heuristic BGZF scan is a functional
    differentiator — the only option when BAI is unavailable.
 
-4. **High-concurrency workloads.** bamstrom at 128 threads (12,872 MB/s) outperforms
+4. **High-concurrency workloads.** bamstorm at 128 threads (12,872 MB/s) outperforms
    both alternatives by a wide margin, making it the best choice for large-scale
    parallel compute environments.

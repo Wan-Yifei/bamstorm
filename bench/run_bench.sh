@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# run_bench.sh — build the bamstrom benchmark image and run bench.py
+# run_bench.sh — build the bamstorm benchmark image and run bench.py
 #
 # Usage:
 #   ./bench/run_bench.sh <bam> <bai> [--csv <file>] [-- <extra bench.py args>]
@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMAGE="bamstrom-bench"
+IMAGE="bamstorm-bench"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 

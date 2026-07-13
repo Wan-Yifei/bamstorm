@@ -1,10 +1,10 @@
 [package]
-name = "bamstrom"
-version = "0.1.0"
+name = "bamstorm"
+version = "0.4.0"
 edition = "2024"
 
 [lib]
-name = "bamstrom"
+name = "bamstorm"
 crate-type = ["cdylib", "rlib"]
 
 [features]
@@ -12,7 +12,11 @@ python = ["pyo3/extension-module"]
 
 [dependencies]
 bstr = "1.12.1"
-noodles = { version = "0.111.0", features = ["bam", "bgzf", "csi", "sam"] }
+noodles = { version = "0.111.0", features = ["bam", "bgzf", "core", "csi", "sam"] }
 noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
 rayon = "1.11.0"
 pyo3 = { version = "0.22", features = ["abi3-py38"], optional = true }
+
+# htslib is only available on Unix; the Python extension is built in Docker (Linux).
+[target.'cfg(unix)'.dependencies]
+rust-htslib = { version = "0.47", default-features = false }

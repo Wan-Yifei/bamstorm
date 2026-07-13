@@ -72,7 +72,12 @@ def run_pysam_pileup(
     start: int | None, stop: int | None,
     timeout: int,
 ) -> tuple[float | None, int | None]:
-    """Returns (elapsed, total_coverage_bases), or (None, None) on timeout."""
+    """Returns (elapsed, total_coverage_bases), or (None, None) on timeout.
+
+    Uses col.pileups (not col.nsegments) to force Python PileupRead object
+    instantiation — the real GIL-bound bottleneck in production pileup code.
+    At 46x depth on chr4 this creates ~8.6B PileupRead objects.
+    """
     import pysam
 
     def _handler(signum, frame):
@@ -87,7 +92,7 @@ def run_pysam_pileup(
                 gen = f.pileup(contig, start, stop)
             else:
                 gen = f.pileup(contig)
-            total = sum(col.nsegments for col in gen)
+            total = sum(1 for col in gen for _ in col.pileups)
         elapsed = time.perf_counter() - t0
         return elapsed, total
     except _PileupTimeout:

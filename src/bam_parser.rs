@@ -361,6 +361,8 @@ pub(crate) fn apply_cigar_to_diff(
 pub(crate) fn apply_cigar_to_base_counts(
     counts: &mut [[u32; 4]],
     seq_bytes: &[u8],
+    qual_bytes: Option<&[u8]>,
+    min_base_quality: u8,
     ref_start: i64,
     cigartuples: &[(u32, u32)],
     region_start: usize,
@@ -378,6 +380,13 @@ pub(crate) fn apply_cigar_to_base_counts(
                 let rp_hi = (rp_start + len).min(region_end);
                 for rp in rp_lo..rp_hi {
                     let qp = query_pos + (rp - rp_start);
+                    if min_base_quality > 0 {
+                        if qual_bytes.and_then(|q| q.get(qp)).copied().unwrap_or(0)
+                            < min_base_quality
+                        {
+                            continue;
+                        }
+                    }
                     if let Some(&b) = seq_bytes.get(qp) {
                         let bi: Option<usize> = match b {
                             b'A' | b'a' => Some(0),
@@ -717,7 +726,7 @@ mod test {
     fn test_apply_cigar_to_base_counts_simple() {
         let seq = b"ACGTACGTAC";
         let mut counts = vec![[0u32; 4]; 10];
-        apply_cigar_to_base_counts(&mut counts, seq, 0, &[(0, 10)], 0);
+        apply_cigar_to_base_counts(&mut counts, seq, None, 0, 0, &[(0, 10)], 0);
         let expected = [
             [1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1],
             [1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1],
@@ -733,7 +742,7 @@ mod test {
         // "5M2D5M" — reads 5 bases, skips 2 ref, reads 5 more bases.
         let seq = b"AAAAATTTTT";
         let mut counts = vec![[0u32; 4]; 12];
-        apply_cigar_to_base_counts(&mut counts, seq, 0, &[(0, 5), (2, 2), (0, 5)], 0);
+        apply_cigar_to_base_counts(&mut counts, seq, None, 0, 0, &[(0, 5), (2, 2), (0, 5)], 0);
         let total: u32 = counts.iter().map(|c| c.iter().sum::<u32>()).sum();
         assert_eq!(total, 10);             // 10 query bases counted
         assert_eq!(counts[5], [0,0,0,0]); // deletion pos 5 has no bases
@@ -746,11 +755,25 @@ mod test {
         // Read at pos 8, "5M", region [0, 10). Bases at 8,9 count; 10..12 ignored.
         let seq = b"ACGTA";
         let mut counts = vec![[0u32; 4]; 10];
-        apply_cigar_to_base_counts(&mut counts, seq, 8, &[(0, 5)], 0);
+        apply_cigar_to_base_counts(&mut counts, seq, None, 0, 8, &[(0, 5)], 0);
         let total: u32 = counts.iter().map(|c| c.iter().sum::<u32>()).sum();
         assert_eq!(total, 2);             // only positions 8,9 in region
         assert_eq!(counts[8], [1,0,0,0]); // A
         assert_eq!(counts[9], [0,1,0,0]); // C
+    }
+
+    // base_counts: min_base_quality filter — low-quality bases are excluded.
+    #[test]
+    fn test_apply_cigar_to_base_counts_min_base_quality() {
+        let seq  = b"ACGT";
+        // qualities: A=20, C=5, G=20, T=5 — only A and G pass threshold of 13
+        let qual = [20u8, 5, 20, 5];
+        let mut counts = vec![[0u32; 4]; 4];
+        apply_cigar_to_base_counts(&mut counts, seq, Some(&qual), 13, 0, &[(0, 4)], 0);
+        assert_eq!(counts[0], [1,0,0,0]); // A passes (q=20)
+        assert_eq!(counts[1], [0,0,0,0]); // C excluded (q=5)
+        assert_eq!(counts[2], [0,0,1,0]); // G passes (q=20)
+        assert_eq!(counts[3], [0,0,0,0]); // T excluded (q=5)
     }
 
     // Reads with real BAM: Σcov == Σ(M/X/= bases) for all mapped reads on chrM.

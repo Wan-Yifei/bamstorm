@@ -27,7 +27,7 @@ Several tools have tackled BAM parallelism before bamstorm, each with a differen
 
 ### QuickBAM
 
-[QuickBAM](https://gitlab.com/yiq/quickbam) (C++, OpenMP / Intel TBB) uses the BAI index's fixed 16 KB bin structure as the unit of parallelism. Each bin becomes an independent work item dispatched to a thread pool. For files without an index it falls back to a heuristic scanner that locates safe parallel entry points by pattern-matching BGZF block headers.
+[QuickBAM](https://gitlab.com/yiq/quickbam)[^4] (C++, OpenMP / Intel TBB) uses the BAI index's fixed 16 KB bin structure as the unit of parallelism. Each bin becomes an independent work item dispatched to a thread pool. For files without an index it falls back to a heuristic scanner that locates safe parallel entry points by pattern-matching BGZF block headers.
 
 ```
 BAI fixed bins → scatter work items → thread pool (OpenMP/TBB)
@@ -41,7 +41,7 @@ The key constraint is that work granularity is tied to the 16 KB bin grid; very 
 
 ### RabbitBAM
 
-[RabbitBAM](https://github.com/RabbitBio/RabbitBAM) (C/C++) targets the parsing bottleneck rather than the IO bottleneck. A dedicated pre-parsing stage scans the byte stream to locate record boundaries without fully decoding each record. Those boundaries are queued into lock-free queues backed by memory pools, and a pool of parser threads consumes them in parallel.
+[RabbitBAM](https://github.com/RabbitBio/RabbitBAM)[^5] (C/C++) targets the parsing bottleneck rather than the IO bottleneck. A dedicated pre-parsing stage scans the byte stream to locate record boundaries without fully decoding each record. Those boundaries are queued into lock-free queues backed by memory pools, and a pool of parser threads consumes them in parallel.
 
 ```
 single fd → sequential read → BGZF decompress
@@ -99,6 +99,24 @@ with bamstorm.AlignmentFile("sample.bam", "sample.bam.bai") as af:
         if read.is_unmapped:
             continue
         print(read.query_name, read.reference_start, read.cigarstring)
+
+# Per-position depth (single-threaded, CIGAR-aware)
+with bamstorm.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+    cov = af.coverage("chr4")             # full chromosome
+    cov = af.coverage("chr4", 1_000_000, 2_000_000)  # 1 Mbp region
+
+# Per-position A/C/G/T counts (parallel, 40× faster than pysam)
+# Returns flat list [A0,C0,G0,T0, A1,C1,G1,T1, ...], length = region_len * 4
+with bamstorm.AlignmentFile("sample.bam", "sample.bam.bai") as af:
+    counts = af.base_pileup("chr4")
+
+    # Explicit pysam-matching filters (these are the benchmark defaults):
+    counts = af.base_pileup(
+        "chr4",
+        flag_filter=0x704,       # skip unmapped, secondary, qc-fail, dup
+        min_base_quality=13,     # pysam default
+        min_mapping_quality=0,   # pysam default
+    )
 ```
 
 ### `BamRecord` attributes
@@ -381,11 +399,72 @@ AWS cold results.
 | 64      | 967      | 503      | 502       | 300   |
 | 128     | **973**  | 504      | 382       | 292   |
 
+### Pileup benchmark: base_pileup vs pysam (chr4, full chromosome)
+
+![Pileup benchmark chr4](docs/benchmark_pileup_chr4.png)
+
+#### Why pileup performance matters
+
+Pileup — computing per-position base counts across all reads — is the fundamental operation behind the three major families of variant callers:
+
+- **Traditional Bayesian callers** (bcftools mpileup, samtools mpileup)[^1] iterate pileup columns directly. At each position they accumulate base frequencies, apply a prior over genotypes, and compute a posterior via the binomial likelihood. The entire variant call is derived from pileup; there is no other data path.
+
+- **Haplotype assembly callers** (GATK HaplotypeCaller, Strelka2)[^2] use pileup-like active-region detection as their first pass. A position is flagged "active" when the pileup shows sufficient evidence of variation (mismatches, indels, soft clips). Only reads overlapping active regions are assembled into haplotypes. The pileup scan therefore gates the expensive local assembly step and directly determines wall-clock time for the common case.
+
+- **Deep learning callers** (DeepVariant, PEPPER-Margin-DeepVariant)[^3] encode the pileup as a multi-channel image — one row per read, one column per reference position, channels encoding base identity, base quality, strand, and MAPQ — and pass this tensor to a CNN. Candidate sites must still be pre-selected with a pileup scan before image generation, and image generation is itself a pileup traversal. Pileup latency directly sets a floor on total runtime.
+
+#### Results (AWS i4i.4xlarge, 16 vCPU, local NVMe)
+
+**Test dataset**
+
+| Parameter | Value |
+|---|---|
+| Contig | chr4, full chromosome |
+| Length | ~190 Mbp |
+| Reads | 57.6M (mapped) |
+| Mean coverage | ~46× |
+| BAM size | 15.3 GB (same file as count benchmark) |
+| Repeats | 3 cold runs; best time reported |
+
+**Cold-cache results**
+
+| Tool | Method | Threads | Best wall-clock | total_cov | vs pysam |
+|------|--------|--------:|----------------:|----------:|---------:|
+| bamstorm | `base_pileup()` | 16 | **37.8 s** | 8,226,892,040 | **40.1×** |
+| bamstorm | `coverage()` | 1 | 2m 24.3 s | 8,608,522,541 | 10.5× |
+| pysam | `col.pileups` | 1 | 25m 18.7 s | 7,604,214,406 | 1× (baseline) |
+
+`base_pileup()` returns a flat array of A/C/G/T counts per reference position; `coverage()` returns per-position depth. Both are implemented entirely in Rust.
+
+**Note on total_cov differences**
+
+The three totals diverge because of different read filters and pileup semantics:
+
+- `coverage()` skips only unmapped reads (flag 0x4) → includes secondary, QC-fail, and duplicate alignments → highest count
+- `base_pileup()` applies flag 0x704 (unmapped | secondary | QC-fail | duplicate) and `min_base_quality=13` to match pysam's defaults; the remaining ~8% gap vs pysam is primarily due to pysam's `ignore_overlaps=True`, which deduplicates bases at positions where paired-end mates overlap (only the higher-quality base is counted); `base_pileup()` does not yet implement overlap deduplication
+
+#### What drives the speedup
+
+`pysam col.pileups` allocates a `PileupRead` Python object for every (read, position) pair. On a 46× dataset with 190 M positions that is roughly 8 billion object allocations, each one acquiring the GIL. Throughput is bounded by the CPython allocator and GIL contention, not by disk or BGZF decompression.
+
+`base_pileup()` avoids this entirely: it splits chr4 into 16 equal sub-regions, opens one noodles indexed reader per chunk, and runs all 16 chunks in parallel with rayon. Each chunk walks CIGAR tuples directly in Rust and increments `counts[pos][base]` with no heap allocation per read per position. The 16 chunks are concatenated into a flat `Vec<u32>` and returned to Python as a single buffer copy.
+
+[^1]: Danecek P. et al. (2021) Twelve years of SAMtools and BCFtools. *GigaScience* 10(2):giab008. https://doi.org/10.1093/gigascience/giab008
+[^2]: DePristo M.A. et al. (2011) A framework for variation discovery and genotyping using next-generation DNA sequencing data. *Nature Genetics* 43:491–498. https://doi.org/10.1038/ng.806
+[^3]: Poplin R. et al. (2018) A universal SNP and small-indel variant caller using deep neural networks. *Nature Biotechnology* 36:983–987. https://doi.org/10.1038/nbt.4235
+[^4]: Pitman W. et al. (2023) quickBAM: a parallelized BAM file access API for high-throughput sequence analysis informatics. *Bioinformatics* 39(8):btad463. https://doi.org/10.1093/bioinformatics/btad463
+[^5]: Yan J. et al. (2025) RabbitBAM: Accelerating BAM File Manipulation on Multi-Core Platforms. *IEEE Trans. Comput. Biol. Bioinform.* 22:2320–2326. https://doi.org/10.1109/TCBBIO.2025.3590412
+
+---
+
 ### Running the benchmark
 
 ```bash
 # AWS (automated, self-terminating EC2 instance)
 ./aws/launch.sh -i <ecr-image-uri> -t i4i.4xlarge
+
+# Coverage / pileup benchmark (separate script)
+./aws/launch_coverage.sh -i <ecr-image-uri> [-c <contig>] [-s <start>] [-e <end>]
 
 # Local
 ./bench/run_bench.sh /data/sample.bam /data/sample.bam.bai --csv results.csv

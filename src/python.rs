@@ -645,13 +645,23 @@ impl AlignmentFile {
     ///   skip if flag & 0x704 (unmapped | secondary | QC-fail | duplicate).
     ///
     /// Returns a flat Vec<u32> of length `(stop - start) * 4`, interleaved as
-    /// [A0, C0, G0, T0, A1, C1, G1, T1, ...].  Total coverage =  sum(result).
-    #[pyo3(signature = (contig, start = None, stop = None))]
+    /// [A0, C0, G0, T0, A1, C1, G1, T1, ...].  Total coverage = sum(result).
+    ///
+    /// Filtering parameters (all optional, applied concurrently inside each rayon chunk):
+    ///   flag_filter        — reads with any of these SAM flags set are excluded
+    ///                        (default 0x704 = unmapped|secondary|qcfail|dup, matches pysam)
+    ///   min_base_quality   — per-base Phred threshold; bases below this are not counted
+    ///                        (default 0 = no filter; pysam default is 13)
+    ///   min_mapping_quality — reads with MAPQ below this are excluded (default 0)
+    #[pyo3(signature = (contig, start = None, stop = None, flag_filter = 0x704_u32, min_base_quality = 0_u8, min_mapping_quality = 0_u8))]
     pub fn base_pileup(
         &self,
         contig: &str,
         start: Option<i64>,
         stop: Option<i64>,
+        flag_filter: u32,
+        min_base_quality: u8,
+        min_mapping_quality: u8,
     ) -> PyResult<Vec<u32>> {
         let header = crate::get_bam_header(&self.bam_path).map_err(to_py_err)?;
         let contig_len = header
@@ -697,13 +707,17 @@ impl AlignmentFile {
                 for result in reader.query(&hdr, &region)?.records() {
                     let rec = result?;
                     let rd = RecordData::from_noodles(&rec, &hdr)?;
-                    // Same default mask as pysam: unmapped | secondary | qc-fail | dup
-                    if rd.flag & 0x704 != 0 || rd.reference_start < 0 {
+                    if rd.flag as u32 & flag_filter != 0 || rd.reference_start < 0 {
+                        continue;
+                    }
+                    if rd.mapping_quality < min_mapping_quality {
                         continue;
                     }
                     apply_cigar_to_base_counts(
                         &mut counts,
                         rd.query_sequence.as_bytes(),
+                        rd.query_qualities.as_deref(),
+                        min_base_quality,
                         rd.reference_start,
                         &rd.cigartuples,
                         cs,

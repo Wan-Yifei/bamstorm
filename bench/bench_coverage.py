@@ -66,12 +66,24 @@ def run_bamstorm_coverage(
 def run_bamstorm_base_pileup(
     bam: str, bai: str, contig: str,
     start: int | None, stop: int | None,
+    flag_filter: int = 0x704,
+    min_base_quality: int = 13,
+    min_mapping_quality: int = 0,
 ) -> tuple[float, int]:
-    """Parallel Rust base_pileup: A/C/G/T counts per position, flag filter 0x704."""
+    """Parallel Rust base_pileup with pysam-matching filters by default.
+
+    Defaults (flag_filter=0x704, min_base_quality=13) match pysam.pileup() so
+    total_cov figures are directly comparable.
+    """
     import bamstorm
     t0 = time.perf_counter()
     af = bamstorm.AlignmentFile(bam, "rb", bai_path=bai)
-    counts = af.base_pileup(contig, start, stop)
+    counts = af.base_pileup(
+        contig, start, stop,
+        flag_filter=flag_filter,
+        min_base_quality=min_base_quality,
+        min_mapping_quality=min_mapping_quality,
+    )
     total = int(sum(counts))
     return time.perf_counter() - t0, total
 

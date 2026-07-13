@@ -331,7 +331,12 @@ pub(crate) fn apply_cigar_to_diff(
                     let si = (s - region_start as i64) as usize;
                     let ei = (e - region_start as i64) as usize;
                     diff[si] += 1;
-                    diff[ei] -= 1;
+                    // ei == diff.len() when the read ends exactly at the region
+                    // boundary; the decrement is irrelevant (prefix sum never
+                    // reads past the array), so skip rather than panic.
+                    if ei < diff.len() {
+                        diff[ei] -= 1;
+                    }
                 }
                 ref_pos += len;
             }
@@ -621,6 +626,17 @@ mod test {
         }
         assert!(cov[..100].iter().all(|&d| d == 1), "positions 0..100 must be covered");
         assert!(cov[100..].iter().all(|&d| d == 0), "positions 100..200 must be 0");
+    }
+
+    // Read ending exactly at region boundary must not panic (off-by-one guard).
+    #[test]
+    fn test_apply_cigar_read_ends_at_region_boundary() {
+        // Region [0, 10), diff len = 10. A "10M" read starting at 0 ends at 10
+        // which equals region_end — the decrement falls on index 10 (== len).
+        let mut diff = vec![0i64; 10];
+        apply_cigar_to_diff(&mut diff, 0, &[(0, 10)], 0); // must not panic
+        let cov: Vec<u32> = diff.iter().scan(0i64, |run, &d| { *run += d; Some((*run).max(0) as u32) }).collect();
+        assert!(cov.iter().all(|&d| d == 1), "all 10 positions must be covered");
     }
 
     // "50M2D50M" — deletion is NOT counted as covered.

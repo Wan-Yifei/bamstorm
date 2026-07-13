@@ -264,7 +264,7 @@ pub fn count(bam_path: &str, bai_path: &str, until_eof: bool) -> PyResult<u64> {
         .map_err(to_py_err)
 }
 
-use crate::bam_parser::apply_cigar_to_diff;
+use crate::bam_parser::{apply_cigar_to_diff, apply_cigar_to_base_counts};
 
 /// Count all BAM records in parallel without requiring a BAI index.
 ///
@@ -636,6 +636,96 @@ impl AlignmentFile {
             cov[i] = running.max(0) as u32;
         }
         Ok(cov)
+    }
+
+    /// Per-position A/C/G/T base counts computed entirely in Rust, using rayon
+    /// to process the region in parallel across all available CPU cores.
+    ///
+    /// Applies the same default flag filter as pysam pileup:
+    ///   skip if flag & 0x704 (unmapped | secondary | QC-fail | duplicate).
+    ///
+    /// Returns a flat Vec<u32> of length `(stop - start) * 4`, interleaved as
+    /// [A0, C0, G0, T0, A1, C1, G1, T1, ...].  Total coverage =  sum(result).
+    #[pyo3(signature = (contig, start = None, stop = None))]
+    pub fn base_pileup(
+        &self,
+        contig: &str,
+        start: Option<i64>,
+        stop: Option<i64>,
+    ) -> PyResult<Vec<u32>> {
+        let header = crate::get_bam_header(&self.bam_path).map_err(to_py_err)?;
+        let contig_len = header
+            .reference_sequences()
+            .get(contig.as_bytes())
+            .map(|rs| rs.length().get() as i64)
+            .ok_or_else(|| PyValueError::new_err(format!("contig '{contig}' not in header")))?;
+
+        let s = start.unwrap_or(0).max(0) as usize;
+        let e = stop.unwrap_or(contig_len).min(contig_len) as usize;
+        if s >= e {
+            return Ok(vec![]);
+        }
+        let region_len = e - s;
+
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = ((region_len + n_threads - 1) / n_threads).max(1);
+
+        // Split [s, e) into up to n_threads sub-regions.
+        let chunks: Vec<(usize, usize)> = (0..n_threads)
+            .map(|i| (s + i * chunk_size, (s + (i + 1) * chunk_size).min(e)))
+            .filter(|&(cs, ce)| cs < ce)
+            .collect();
+
+        let contig   = contig.to_string();
+        let bam_path = self.bam_path.clone();
+        let bai_path = self.bai_path.clone();
+
+        // Each rayon worker opens its own reader for one sub-region.
+        let per_chunk: io::Result<Vec<Vec<[u32; 4]>>> = chunks
+            .into_par_iter()
+            .map(|(cs, ce)| -> io::Result<Vec<[u32; 4]>> {
+                let mut counts = vec![[0u32; 4]; ce - cs];
+                let region_str = format!("{contig}:{}-{ce}", cs + 1);
+                let region: Region = region_str.parse().map_err(|e: noodles::core::region::ParseError| {
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                let index = noodles_bam::bai::fs::read(&bai_path)?;
+                let mut reader = noodles_bam::io::indexed_reader::Builder::default()
+                    .set_index(index)
+                    .build_from_path(&bam_path)?;
+                let hdr = reader.read_header()?;
+                for result in reader.query(&hdr, &region)?.records() {
+                    let rec = result?;
+                    let rd = RecordData::from_noodles(&rec, &hdr)?;
+                    // Same default mask as pysam: unmapped | secondary | qc-fail | dup
+                    if rd.flag & 0x704 != 0 || rd.reference_start < 0 {
+                        continue;
+                    }
+                    apply_cigar_to_base_counts(
+                        &mut counts,
+                        rd.query_sequence.as_bytes(),
+                        rd.reference_start,
+                        &rd.cigartuples,
+                        cs,
+                    );
+                }
+                Ok(counts)
+            })
+            .collect();
+
+        let per_chunk = per_chunk.map_err(to_py_err)?;
+
+        // Flatten [A, C, G, T] per position into a Vec<u32>.
+        let mut result = Vec::with_capacity(region_len * 4);
+        for chunk in per_chunk {
+            for [a, c, g, t] in chunk {
+                result.push(a);
+                result.push(c);
+                result.push(g);
+                result.push(t);
+            }
+        }
+        Ok(result)
     }
 
     fn __iter__(&self) -> PyResult<RecordIterator> {

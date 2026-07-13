@@ -63,6 +63,19 @@ def run_bamstorm_coverage(
     return time.perf_counter() - t0, total
 
 
+def run_bamstorm_base_pileup(
+    bam: str, bai: str, contig: str,
+    start: int | None, stop: int | None,
+) -> tuple[float, int]:
+    """Parallel Rust base_pileup: A/C/G/T counts per position, flag filter 0x704."""
+    import bamstorm
+    t0 = time.perf_counter()
+    af = bamstorm.AlignmentFile(bam, "rb", bai_path=bai)
+    counts = af.base_pileup(contig, start, stop)
+    total = int(sum(counts))
+    return time.perf_counter() - t0, total
+
+
 class _PileupTimeout(Exception):
     pass
 
@@ -218,8 +231,12 @@ def main() -> None:
     # ── cold runs ─────────────────────────────────────────────────────────────
 
     bs_cold: list[tuple[float, int]] = []
+    bp_cold: list[tuple[float, int]] = []   # bamstorm base_pileup (parallel)
+    ps_cold: list[tuple[float | None, int | None]] = []
+    ps_timed_out = False
+
     if has_bamstorm:
-        print(f"  [bamstorm coverage]  cold × {args.repeats}")
+        print(f"  [bamstorm coverage (single-thread)]  cold × {args.repeats}")
         for i in range(1, args.repeats + 1):
             if not args.no_drop_cache:
                 drop_caches(args.bam, args.bai)
@@ -230,10 +247,19 @@ def main() -> None:
             print(f"    run {i}: {fmt_time(elapsed)}  total_cov={total:,}", flush=True)
         print()
 
-    ps_cold: list[tuple[float | None, int | None]] = []
-    ps_timed_out = False
+        print(f"  [bamstorm base_pileup (parallel)]  cold × {args.repeats}")
+        for i in range(1, args.repeats + 1):
+            if not args.no_drop_cache:
+                drop_caches(args.bam, args.bai)
+            elapsed, total = run_bamstorm_base_pileup(
+                args.bam, args.bai, args.contig, args.start, args.stop)
+            bp_cold.append((elapsed, total))
+            all_rows.append(_record("bamstorm base_pileup", "cold", i, elapsed, total))
+            print(f"    run {i}: {fmt_time(elapsed)}  total_cov={total:,}", flush=True)
+        print()
+
     if has_pysam:
-        print(f"  [pysam pileup]  cold × {args.repeats}  (timeout={args.timeout}s each)")
+        print(f"  [pysam pileup (col.pileups)]  cold × {args.repeats}  (timeout={args.timeout}s each)")
         for i in range(1, args.repeats + 1):
             if not args.no_drop_cache:
                 drop_caches(args.bam, args.bai)
@@ -251,6 +277,7 @@ def main() -> None:
     # ── warm runs ─────────────────────────────────────────────────────────────
 
     bs_warm: list[tuple[float, int]] = []
+    bp_warm: list[tuple[float, int]] = []
     ps_warm: list[tuple[float | None, int | None]] = []
 
     if args.warm_repeats > 0:
@@ -263,6 +290,14 @@ def main() -> None:
                     args.bam, args.bai, args.contig, args.start, args.stop)
                 bs_warm.append((elapsed, total))
                 all_rows.append(_record("bamstorm coverage", "warm", i, elapsed, total))
+                print(f"    run {i}: {fmt_time(elapsed)}  total_cov={total:,}", flush=True)
+
+            print(f"\n  [bamstorm base_pileup]  warm × {args.warm_repeats}")
+            for i in range(1, args.warm_repeats + 1):
+                elapsed, total = run_bamstorm_base_pileup(
+                    args.bam, args.bai, args.contig, args.start, args.stop)
+                bp_warm.append((elapsed, total))
+                all_rows.append(_record("bamstorm base_pileup", "warm", i, elapsed, total))
                 print(f"    run {i}: {fmt_time(elapsed)}  total_cov={total:,}", flush=True)
 
         if has_pysam and not ps_timed_out:
@@ -284,37 +319,42 @@ def main() -> None:
         valid = [e for e, _ in runs if e is not None]
         return min(valid) if valid else None
 
-    bs_best = best_time(bs_cold)
-    ps_best = best_time(ps_cold)
-    bs_warm_best = best_time(bs_warm)
-    ps_warm_best = best_time(ps_warm)
-
-    print("  ── Summary " + "─" * 55)
-    print(f"  {'Tool':<28}  {'cold best':>12}  {'warm best':>12}  {'cold total_cov':>18}")
-    print("  " + "─" * 76)
-
     def best_total(runs: list) -> int | None:
         valid = [(e, t) for e, t in runs if e is not None]
         if not valid:
             return None
         return min(valid, key=lambda x: x[0])[1]
 
+    bs_best      = best_time(bs_cold)
+    bp_best      = best_time(bp_cold)
+    ps_best      = best_time(ps_cold)
+    bs_warm_best = best_time(bs_warm)
+    bp_warm_best = best_time(bp_warm)
+    ps_warm_best = best_time(ps_warm)
+
+    print("  ── Summary " + "─" * 64)
+    print(f"  {'Tool':<34}  {'cold best':>12}  {'warm best':>12}  {'cold total_cov':>18}")
+    print("  " + "─" * 84)
+
     if has_bamstorm:
-        tot = best_total(bs_cold)
-        tot_str = f"{tot:,}" if tot is not None else "N/A"
-        warm_str = fmt_time(bs_warm_best) if bs_warm else "—"
-        print(f"  {'bamstorm coverage':<28}  {fmt_time(bs_best):>12}  {warm_str:>12}  {tot_str:>18}")
+        for label, cold, warm, cold_runs, warm_runs in [
+            ("bamstorm coverage (1-thread)", bs_best, bs_warm_best, bs_cold, bs_warm),
+            ("bamstorm base_pileup (parallel)", bp_best, bp_warm_best, bp_cold, bp_warm),
+        ]:
+            tot = best_total(cold_runs)
+            tot_str  = f"{tot:,}" if tot is not None else "N/A"
+            warm_str = fmt_time(warm) if warm_runs else "—"
+            print(f"  {label:<34}  {fmt_time(cold):>12}  {warm_str:>12}  {tot_str:>18}")
     if has_pysam:
         tot = best_total(ps_cold)
-        tot_str = f"{tot:,}" if tot is not None else "N/A"
+        tot_str  = f"{tot:,}" if tot is not None else "N/A"
         warm_str = fmt_time(ps_warm_best) if ps_warm else "—"
-        print(f"  {'pysam pileup':<28}  {fmt_time(ps_best):>12}  {warm_str:>12}  {tot_str:>18}")
+        print(f"  {'pysam pileup (col.pileups)':<34}  {fmt_time(ps_best):>12}  {warm_str:>12}  {tot_str:>18}")
 
     if has_bamstorm and has_pysam:
         print()
-        print(f"  Cold speedup  (pysam / bamstorm): {fmt_speedup(bs_best, ps_best)}")
-        if bs_warm and ps_warm:
-            print(f"  Warm speedup  (pysam / bamstorm): {fmt_speedup(bs_warm_best, ps_warm_best)}")
+        print(f"  Speedup coverage   (pysam / bamstorm 1-thread): {fmt_speedup(bs_best, ps_best)}")
+        print(f"  Speedup base_pileup(pysam / bamstorm parallel):  {fmt_speedup(bp_best, ps_best)}")
     print()
 
     # ── CSV ───────────────────────────────────────────────────────────────────

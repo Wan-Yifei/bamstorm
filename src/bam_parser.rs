@@ -346,6 +346,62 @@ pub(crate) fn apply_cigar_to_diff(
     }
 }
 
+/// Per-position A/C/G/T counts for base_pileup.
+///
+/// `counts` is a mutable slice of `[u32; 4]` arrays, one per reference position
+/// in `[region_start, region_start + counts.len())`. Each array holds
+/// `[A_count, C_count, G_count, T_count]`.
+///
+/// `seq_bytes` is the read sequence as ASCII bytes (from RecordData.query_sequence).
+///
+/// CIGAR ops M/=/X (0,7,8) consume both ref and query; I/S (1,4) consume query
+/// only; D/N (2,3) consume ref only; H/P (5,6) consume neither.
+/// Positions outside the region are ignored; reads that extend past the region
+/// boundary are correctly clipped.
+pub(crate) fn apply_cigar_to_base_counts(
+    counts: &mut [[u32; 4]],
+    seq_bytes: &[u8],
+    ref_start: i64,
+    cigartuples: &[(u32, u32)],
+    region_start: usize,
+) {
+    let region_end = region_start + counts.len();
+    let mut ref_pos = ref_start;
+    let mut query_pos: usize = 0;
+
+    for &(op, len) in cigartuples {
+        let len = len as usize;
+        match op {
+            0 | 7 | 8 => {
+                let rp_start = ref_pos as usize;
+                let rp_lo = rp_start.max(region_start);
+                let rp_hi = (rp_start + len).min(region_end);
+                for rp in rp_lo..rp_hi {
+                    let qp = query_pos + (rp - rp_start);
+                    if let Some(&b) = seq_bytes.get(qp) {
+                        let bi: Option<usize> = match b {
+                            b'A' | b'a' => Some(0),
+                            b'C' | b'c' => Some(1),
+                            b'G' | b'g' => Some(2),
+                            b'T' | b't' => Some(3),
+                            _ => None,
+                        };
+                        if let Some(bi) = bi {
+                            counts[rp - region_start][bi] += 1;
+                        }
+                    }
+                }
+                ref_pos += len as i64;
+                query_pos += len;
+            }
+            1 | 4 => { query_pos += len; }
+            2 | 3 => { ref_pos += len as i64; }
+            5 | 6 => {}
+            _ => {}
+        }
+    }
+}
+
 // ── Step 14 building blocks: no-index parallel reading ────────────────────────
 
 /// Scan `data` (raw compressed file bytes) for the next valid BGZF block
@@ -654,6 +710,47 @@ mod test {
         assert!(cov[50..52].iter().all(|&d| d == 0),  "deletion 50..52 must NOT be covered");
         assert!(cov[52..102].iter().all(|&d| d == 1), "positions 52..102 must be covered");
         assert!(cov[102..].iter().all(|&d| d == 0),   "tail must be 0");
+    }
+
+    // base_counts: "10M" read "ACGTACGTAC" → each position has exactly one base.
+    #[test]
+    fn test_apply_cigar_to_base_counts_simple() {
+        let seq = b"ACGTACGTAC";
+        let mut counts = vec![[0u32; 4]; 10];
+        apply_cigar_to_base_counts(&mut counts, seq, 0, &[(0, 10)], 0);
+        let expected = [
+            [1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1],
+            [1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1],
+            [1,0,0,0], [0,1,0,0],
+        ];
+        assert_eq!(counts, expected);
+        assert_eq!(counts.iter().map(|c| c.iter().sum::<u32>()).sum::<u32>(), 10);
+    }
+
+    // base_counts: deletion skipped — D does not produce base counts.
+    #[test]
+    fn test_apply_cigar_to_base_counts_deletion_skipped() {
+        // "5M2D5M" — reads 5 bases, skips 2 ref, reads 5 more bases.
+        let seq = b"AAAAATTTTT";
+        let mut counts = vec![[0u32; 4]; 12];
+        apply_cigar_to_base_counts(&mut counts, seq, 0, &[(0, 5), (2, 2), (0, 5)], 0);
+        let total: u32 = counts.iter().map(|c| c.iter().sum::<u32>()).sum();
+        assert_eq!(total, 10);             // 10 query bases counted
+        assert_eq!(counts[5], [0,0,0,0]); // deletion pos 5 has no bases
+        assert_eq!(counts[6], [0,0,0,0]); // deletion pos 6 has no bases
+    }
+
+    // base_counts: region clipping — read extending past region boundary is ignored.
+    #[test]
+    fn test_apply_cigar_to_base_counts_boundary() {
+        // Read at pos 8, "5M", region [0, 10). Bases at 8,9 count; 10..12 ignored.
+        let seq = b"ACGTA";
+        let mut counts = vec![[0u32; 4]; 10];
+        apply_cigar_to_base_counts(&mut counts, seq, 8, &[(0, 5)], 0);
+        let total: u32 = counts.iter().map(|c| c.iter().sum::<u32>()).sum();
+        assert_eq!(total, 2);             // only positions 8,9 in region
+        assert_eq!(counts[8], [1,0,0,0]); // A
+        assert_eq!(counts[9], [0,1,0,0]); // C
     }
 
     // Reads with real BAM: Σcov == Σ(M/X/= bases) for all mapped reads on chrM.

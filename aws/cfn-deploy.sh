@@ -10,6 +10,12 @@ set -euo pipefail
 
 export MSYS_NO_PATHCONV=1
 
+# On Windows, Docker Desktop may not be injected into the Git Bash PATH.
+# Add the known Docker Desktop bin directory as a fallback.
+if ! command -v docker &>/dev/null; then
+    export PATH="$PATH:/c/Program Files/Docker/Docker/resources/bin"
+fi
+
 PROFILE="${AWS_PROFILE:-admin}"
 REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="bamstorm-bench-stack"
